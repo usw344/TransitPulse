@@ -1,0 +1,24 @@
+# Environment and local state
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Python build artifacts
+*.egg-info/
+dist/
+build/
+
+# Node / Next.js artifacts
+apps/web/node_modules/
+apps/web/.next/
+apps/web/out/
+apps/web/.npm-cache/
+apps/web/tsconfig.tsbuildinfo
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.vscode/
