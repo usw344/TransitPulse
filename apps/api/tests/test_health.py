@@ -10,8 +10,14 @@ def test_api_health(client: TestClient) -> None:
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
+    proxied_response = client.get("/api/health")
+    assert proxied_response.status_code == 200
+    assert proxied_response.json() == {"status": "ok"}
 
-def test_database_health_uses_real_postgis_connection(client: TestClient) -> None:
+
+def test_database_health_uses_real_postgis_connection(
+    client: TestClient, database_ready: None
+) -> None:
     response = client.get("/health/db")
 
     assert response.status_code == 200
@@ -20,7 +26,7 @@ def test_database_health_uses_real_postgis_connection(client: TestClient) -> Non
     assert payload["postgis_version"]
 
 
-def test_postgis_spatial_function_is_available() -> None:
+def test_postgis_spatial_function_is_available(database_ready: None) -> None:
     """This is an integration test: it requires the real configured PostgreSQL service."""
 
     with get_engine().connect() as connection:

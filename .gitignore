@@ -1,6 +1,7 @@
 # Environment and local state
 .env
 .venv/
+.runtime/
 __pycache__/
 .pytest_cache/
 .coverage
@@ -22,3 +23,6 @@ apps/web/tsconfig.tsbuildinfo
 .DS_Store
 Thumbs.db
 .vscode/
+.env.example
+migrations/env.py
+migrations/env.py

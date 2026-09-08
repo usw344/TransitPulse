@@ -1,45 +1,47 @@
 # TransitPulse
 
-Foundation for TransitPulse, a future public-transit analytics platform. This milestone deliberately contains only a frontend, API, and PostGIS-backed connectivity check—no GTFS or analytics schema.
+TransitPulse is an Edmonton live transit operations viewer. It combines a versioned static GTFS import with official ETS GTFS-Realtime Vehicle Positions, Trip Updates, and Alerts, plus bounded historical vehicle recording.
 
-## Run locally
+## Start on Windows
 
-Prerequisite: Docker Desktop with Docker Compose enabled.
+Install a local PostgreSQL server with the matching PostGIS extension first, then create a `transitpulse` database and role (the development defaults are in `.env.example`). Double-click `START_TRANSITPULSE.bat` from the repository root. It checks PostGIS, migrates safely, imports the official static feed only when no successful feed exists, starts API/web/recorder processes, and opens `http://localhost:3000`.
 
-```sh
-docker compose up --build
+If it reports that PostGIS is unavailable, install the PostGIS bundle matching PostgreSQL's major version. The launcher never recreates or clears a database automatically.
+
+## Native development
+
+Use local Python, Node/npm, and PostgreSQL with PostGIS. Copy `.env.example` to `.env` to override the database or official source URLs.
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic upgrade head
+.\.venv\Scripts\python.exe -m transitpulse_api.import_gtfs
+.\.venv\Scripts\python.exe -m uvicorn transitpulse_api.main:app --app-dir apps/api --reload
 ```
 
-Open <http://localhost:3000>. The page calls the FastAPI service through the frontend proxy and displays both API and database/PostGIS status.
+In another shell:
 
-Useful endpoints:
-
-```text
-http://localhost:8000/health
-http://localhost:8000/health/db
+```powershell
+cd apps/web
+npm install
+npm run dev
 ```
 
-Compose automatically runs `alembic upgrade head` before starting the API. It uses development-only default credentials; optionally copy `.env.example` to `.env` to override them.
+Open `http://localhost:3000`. The frontend proxies `/api/*` to the FastAPI service; set `API_BASE_URL` if the API runs elsewhere.
 
-Stop the stack with `docker compose down`. Use `docker compose down -v` only when you intentionally want to remove the local database volume.
+In a third shell, record current state:
 
-## Tests
-
-The backend integration tests require a real PostGIS database and never mock it. With the stack running:
-
-```sh
-docker compose exec api pytest
+```powershell
+.\.venv\Scripts\python.exe -m transitpulse_api.realtime_recorder
 ```
 
-The CI workflow starts an isolated PostGIS service, applies migrations, runs those tests, and type-checks/builds the frontend.
+The importer downloads the official City of Edmonton / ETS GTFS ZIP by default. Realtime URLs, polling, freshness, and operations thresholds are configurable via `TRANSITPULSE_*` settings. Historical observations retain the imported static feed ID used at capture time.
 
-## Layout
+## Checks
 
-```text
-apps/api/       FastAPI application and tests
-apps/web/       Next.js frontend
-migrations/     Alembic migration history
-docs/           concise architecture notes
+```powershell
+.\.venv\Scripts\python.exe -m alembic upgrade head --sql
+cd apps/api; ..\..\.venv\Scripts\python.exe -m pytest
+cd apps/web; npm run typecheck; npm run build
 ```
 
-See [docs/foundation.md](docs/foundation.md) for the M0 boundary and runtime request path.
+Database-backed tests require the migrated native PostgreSQL/PostGIS instance; they skip when it is unavailable. The history API enforces a 24-hour maximum query range and a 5,000-observation maximum; replay is intentionally not implemented.

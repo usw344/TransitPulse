@@ -18,8 +18,9 @@ config.set_main_option("sqlalchemy.url", settings.database_url)
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# No application schema exists in M0. Revisions are explicit until domain models arrive.
-target_metadata = None
+from transitpulse_api.models import Base  # noqa: E402
+
+target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:

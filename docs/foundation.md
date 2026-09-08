@@ -1,11 +1,5 @@
-# M0 foundation
+# TransitPulse foundation
 
-TransitPulse is a modular monolith. The initial runtime consists of one Next.js frontend, one FastAPI application, and one PostgreSQL/PostGIS database. There are no domain modules or transit data tables yet.
+TransitPulse remains a modular monolith: browser → Next.js `/api/*` rewrite → FastAPI → PostgreSQL/PostGIS. Alembic owns the schema. Static GTFS data is immutable per feed version, and API queries resolve either the newest successful feed or an explicit historical `feed_id`.
 
-```text
-Browser -> Next.js (/api/* rewrite) -> FastAPI -> PostgreSQL + PostGIS
-```
-
-The frontend calls same-origin `/api/health` and `/api/health/db`; Next.js proxies those requests to the API using `API_BASE_URL`. In Compose that is the internal `api` service, so browser clients do not need database or API-container network access.
-
-Alembic owns database evolution. The first revision enables the PostGIS extension only. Future transit schema changes should be additive Alembic revisions, kept in bounded modules within `apps/api/transitpulse_api` rather than split into services prematurely.
+The first user-facing slice is the MapLibre Edmonton network viewer. It fetches the background route geometry once and requests a route’s detail, stops, and shape only after selection, leaving room for future realtime map sources without a frontend rewrite.
