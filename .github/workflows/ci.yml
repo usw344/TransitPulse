@@ -23,6 +23,7 @@ jobs:
           --health-retries 12
     env:
       TRANSITPULSE_DATABASE_URL: postgresql+psycopg://transitpulse:transitpulse@localhost:5432/transitpulse
+      TRANSITPULSE_ALLOW_DESTRUCTIVE_TEST_DB: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

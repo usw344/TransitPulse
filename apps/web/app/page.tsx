@@ -11,7 +11,7 @@ import {
   type GeoJSONSource,
 } from "maplibre-gl";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { Feature, FeatureCollection, Point } from "geojson";
+import type { Feature, FeatureCollection, LineString, Point } from "geojson";
 
 type ServiceStatus = "loading" | "online" | "offline";
 type NetworkState = "loading" | "ready" | "empty" | "error";
@@ -101,6 +101,103 @@ const EMPTY_COLLECTION: FeatureCollection = {
 
 const EDMONTON_CENTER: [number, number] = [-113.4938, 53.5461];
 const MAP_STYLE = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json";
+
+const FALLBACK_BOUNDS = { west: -113.95, east: -113.14, south: 53.32, north: 53.75 };
+
+function fallbackPoint(coordinates: number[]): [number, number] {
+  const [longitude, latitude] = coordinates;
+  return [
+    ((longitude - FALLBACK_BOUNDS.west) / (FALLBACK_BOUNDS.east - FALLBACK_BOUNDS.west)) * 1000,
+    ((FALLBACK_BOUNDS.north - latitude) / (FALLBACK_BOUNDS.north - FALLBACK_BOUNDS.south)) * 1000,
+  ];
+}
+
+function fallbackPath(feature: Feature, stride: number): string | null {
+  if (!feature.geometry || feature.geometry.type !== "LineString") return null;
+  const coordinates = (feature as Feature<LineString>).geometry.coordinates;
+  return coordinates
+    .filter((_, index) => index === 0 || index === coordinates.length - 1 || index % stride === 0)
+    .map(([longitude, latitude], index) => {
+      const [x, y] = fallbackPoint([longitude, latitude]);
+      return `${index === 0 ? "M" : "L"}${x.toFixed(1)} ${y.toFixed(1)}`;
+    })
+    .join(" ");
+}
+
+function cssRouteColor(value: unknown, fallback = "#f97316"): string {
+  return typeof value === "string" && /^[0-9a-f]{6}$/i.test(value) ? `#${value}` : fallback;
+}
+
+function TransitMapFallback({
+  networkShapes,
+  selectedShapes,
+  selectedStops,
+  vehicles,
+}: {
+  networkShapes: GeoJsonFeatureCollection | null;
+  selectedShapes: GeoJsonFeatureCollection | null;
+  selectedStops: GeoJsonFeatureCollection | null;
+  vehicles: RealtimeVehicleCollection | null;
+}) {
+  return (
+    <svg
+      aria-label="Edmonton geographic transit network"
+      className="transit-map-fallback"
+      preserveAspectRatio="none"
+      role="img"
+      viewBox="0 0 1000 1000"
+    >
+      <rect fill="#dbe7e8" fillOpacity="0.2" height="1000" width="1000" />
+      <g className="fallback-grid" aria-hidden="true">
+        {[150, 300, 450, 600, 750, 900].map((position) => (
+          <path d={`M0 ${position} H1000 M${position} 0 V1000`} key={position} />
+        ))}
+      </g>
+      <path
+        aria-hidden="true"
+        className="fallback-river"
+        d="M-40 610 C110 555 165 655 270 600 S430 555 540 600 S705 670 815 585 S950 525 1040 570"
+      />
+      <text className="fallback-city-label" x="500" y="420">EDMONTON</text>
+      <text className="fallback-city-subtitle" x="500" y="446">ALBERTA · LIVE TRANSIT NETWORK</text>
+      <g
+        className="fallback-network"
+        aria-label={`${networkShapes?.features.length ?? 0} static route shapes`}
+        opacity={selectedShapes?.features.length ? 0.26 : 1}
+      >
+        {networkShapes?.features.map((feature, index) => {
+          const path = fallbackPath(feature, 8);
+          return path ? <path d={path} key={`network-${index}`} /> : null;
+        })}
+      </g>
+      <g className="fallback-selected-route" aria-label="Selected route geometry">
+        {selectedShapes?.features.map((feature, index) => {
+          const path = fallbackPath(feature, 1);
+          if (!path) return null;
+          return (
+            <g key={`selected-${index}`}>
+              <path className="fallback-selected-route-casing" d={path} />
+              <path d={path} stroke={cssRouteColor(feature.properties?.color)} />
+            </g>
+          );
+        })}
+      </g>
+      <g className="fallback-stops" aria-label={`${selectedStops?.features.length ?? 0} selected route stops`}>
+        {selectedStops?.features.map((feature, index) => {
+          if (!feature.geometry || feature.geometry.type !== "Point") return null;
+          const [x, y] = fallbackPoint(feature.geometry.coordinates);
+          return <circle cx={x} cy={y} key={`stop-${index}`} r="4.2" />;
+        })}
+      </g>
+      <g className="fallback-vehicles" aria-label={`${vehicles?.features.length ?? 0} live vehicles`}>
+        {vehicles?.features.map((feature) => {
+          const [x, y] = fallbackPoint(feature.geometry.coordinates);
+          return <circle cx={x} cy={y} key={feature.properties?.vehicle_id ?? `${x}-${y}`} r="4.6" />;
+        })}
+      </g>
+    </svg>
+  );
+}
 
 function asFeatureCollection(data: GeoJsonFeatureCollection | null): FeatureCollection {
   return data ? { type: "FeatureCollection", features: data.features } : EMPTY_COLLECTION;
@@ -240,6 +337,11 @@ export default function Home() {
       center: EDMONTON_CENTER,
       zoom: 10.5,
       attributionControl: false,
+    });
+    map.on("error", (event) => {
+      const reason = event.error instanceof Error ? event.error.message : "MapLibre could not render the map";
+      setNetworkState("error");
+      setNetworkMessage(`Map error: ${reason}`);
     });
     map.addControl(new NavigationControl({ showCompass: false }), "bottom-right");
     map.addControl(new AttributionControl({ compact: true }), "bottom-right");
@@ -423,6 +525,12 @@ export default function Home() {
     <main className="transit-shell">
       <section className="map-pane" aria-label="Edmonton transit network map">
         <div className="map" ref={mapContainerRef} />
+        <TransitMapFallback
+          networkShapes={networkShapes}
+          selectedShapes={selectedShapes}
+          selectedStops={selectedStops}
+          vehicles={vehicles}
+        />
         <div className="map-brand">
           <span className="pulse-mark" aria-hidden="true">●</span>
           <div><strong>TransitPulse</strong><span>Edmonton live operations</span></div>

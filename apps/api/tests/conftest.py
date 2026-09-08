@@ -1,3 +1,5 @@
+import os
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
@@ -5,9 +7,19 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from transitpulse_api.database import get_engine
+from transitpulse_api.config import settings
 from transitpulse_api.main import app
 
 _database_unavailable_reason: str | None = None
+_test_database_url = os.getenv("TRANSITPULSE_TEST_DATABASE_URL")
+
+# Integration fixtures deliberately truncate every TransitPulse table.  They
+# must never silently point at the local application database, which can hold
+# a multi-million-row GTFS import and recorded observations.  CI explicitly
+# opts in because its PostGIS service is disposable.
+if _test_database_url:
+    settings.database_url = _test_database_url
+    get_engine.cache_clear()
 
 
 @pytest.fixture
@@ -21,6 +33,10 @@ def database_ready() -> None:
     """Skip integration coverage only when the configured native DB is unavailable."""
 
     global _database_unavailable_reason
+    if not _test_database_url and os.getenv("TRANSITPULSE_ALLOW_DESTRUCTIVE_TEST_DB") != "1":
+        pytest.skip(
+            "integration tests require TRANSITPULSE_TEST_DATABASE_URL; refusing to truncate the application database"
+        )
     if _database_unavailable_reason is not None:
         pytest.skip(_database_unavailable_reason)
     try:
