@@ -169,7 +169,17 @@ class HistoryVehicleObservationFeature(BaseModel):
 
 class HistoryVehicleObservationCollection(BaseModel):
     type: Literal["FeatureCollection"] = "FeatureCollection"
+    static_feed_id: UUID
     features: list[HistoryVehicleObservationFeature]
     start: datetime
     end: datetime
     limit: int
+
+
+class HistoryAvailabilityResponse(BaseModel):
+    """The bounded recorded range available for replay on one static feed."""
+
+    static_feed_id: UUID
+    first_observed_at: datetime | None
+    last_observed_at: datetime | None
+    observation_count: int

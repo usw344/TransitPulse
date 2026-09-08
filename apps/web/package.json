@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:replay": "tsc --ignoreConfig --outDir .next/replay-test --module commonjs --target es2020 --types node --esModuleInterop app/replay.ts tests/replay.test.ts && node --test .next/replay-test/tests/replay.test.js"
   },
   "dependencies": {
     "maplibre-gl": "^6.7.0",

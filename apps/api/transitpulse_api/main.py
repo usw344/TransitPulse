@@ -9,12 +9,13 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from sqlalchemy import func, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from transitpulse_api.api_models import (
     AgencyResponse,
+    HistoryAvailabilityResponse,
     HistoryVehicleObservationCollection,
     HistoryVehicleObservationFeature,
     HistoryVehicleObservationProperties,
@@ -352,9 +353,21 @@ def history_collection(
     limit: int,
     vehicle_id: str | None = None,
     route_id: str | None = None,
-    feed_id: UUID | None = None,
+    static_feed_id: UUID,
 ) -> HistoryVehicleObservationCollection:
     observed_time = func.coalesce(VehicleObservation.observed_at, VehicleObservation.recorded_at)
+    time_range = or_(
+        and_(
+            VehicleObservation.observed_at.is_not(None),
+            VehicleObservation.observed_at >= start,
+            VehicleObservation.observed_at < end,
+        ),
+        and_(
+            VehicleObservation.observed_at.is_(None),
+            VehicleObservation.recorded_at >= start,
+            VehicleObservation.recorded_at < end,
+        ),
+    )
     statement = (
         select(
             VehicleObservation,
@@ -363,8 +376,8 @@ def history_collection(
         )
         .where(
             VehicleObservation.position.is_not(None),
-            observed_time >= start,
-            observed_time < end,
+            VehicleObservation.static_feed_id == static_feed_id,
+            time_range,
         )
         .order_by(observed_time.asc(), VehicleObservation.id.asc())
         .limit(limit)
@@ -373,10 +386,9 @@ def history_collection(
         statement = statement.where(VehicleObservation.vehicle_id == vehicle_id)
     if route_id is not None:
         statement = statement.where(VehicleObservation.route_gtfs_id == route_id)
-    if feed_id is not None:
-        statement = statement.where(VehicleObservation.static_feed_id == feed_id)
     rows = session.execute(statement).all()
     return HistoryVehicleObservationCollection(
+        static_feed_id=static_feed_id,
         start=start,
         end=end,
         limit=limit,
@@ -405,6 +417,66 @@ def history_collection(
     )
 
 
+@app.get("/api/history/availability", response_model=HistoryAvailabilityResponse, tags=["history"])
+def history_availability(
+    feed: FeedDependency,
+    session: SessionDependency,
+    route_id: str | None = Query(default=None),
+    vehicle_id: str | None = Query(default=None),
+) -> HistoryAvailabilityResponse:
+    """Expose only the real recorded range a replay control can select."""
+
+    if route_id is not None:
+        route_for_feed(session, feed, route_id)
+    observed_time = func.coalesce(VehicleObservation.observed_at, VehicleObservation.recorded_at)
+    statement = select(
+        func.min(observed_time),
+        func.max(observed_time),
+        func.count(),
+    ).where(VehicleObservation.static_feed_id == feed.id)
+    if route_id is not None:
+        statement = statement.where(VehicleObservation.route_gtfs_id == route_id)
+    if vehicle_id is not None:
+        statement = statement.where(VehicleObservation.vehicle_id == vehicle_id)
+    first_observed_at, last_observed_at, observation_count = session.execute(statement).one()
+    return HistoryAvailabilityResponse(
+        static_feed_id=feed.id,
+        first_observed_at=first_observed_at,
+        last_observed_at=last_observed_at,
+        observation_count=observation_count,
+    )
+
+
+@app.get(
+    "/api/history/observations",
+    response_model=HistoryVehicleObservationCollection,
+    tags=["history"],
+)
+def history_observations(
+    feed: FeedDependency,
+    session: SessionDependency,
+    start: datetime | None = Query(default=None),
+    end: datetime | None = Query(default=None),
+    limit: int = Query(default=5000, ge=1, le=5000),
+    route_id: str | None = Query(default=None),
+    vehicle_id: str | None = Query(default=None),
+) -> HistoryVehicleObservationCollection:
+    """Return a bounded, feed-consistent observation stream for browser replay."""
+
+    if route_id is not None:
+        route_for_feed(session, feed, route_id)
+    window_start, window_end = history_window(start, end)
+    return history_collection(
+        session,
+        start=window_start,
+        end=window_end,
+        limit=limit,
+        route_id=route_id,
+        vehicle_id=vehicle_id,
+        static_feed_id=feed.id,
+    )
+
+
 @app.get(
     "/api/history/vehicles/{vehicle_id}",
     response_model=HistoryVehicleObservationCollection,
@@ -412,11 +484,11 @@ def history_collection(
 )
 def vehicle_history(
     vehicle_id: str,
+    feed: FeedDependency,
     session: SessionDependency,
     start: datetime | None = Query(default=None),
     end: datetime | None = Query(default=None),
     limit: int = Query(default=1000, ge=1, le=5000),
-    feed_id: UUID | None = Query(default=None),
 ) -> HistoryVehicleObservationCollection:
     window_start, window_end = history_window(start, end)
     return history_collection(
@@ -425,7 +497,7 @@ def vehicle_history(
         end=window_end,
         limit=limit,
         vehicle_id=vehicle_id,
-        feed_id=feed_id,
+        static_feed_id=feed.id,
     )
 
 
@@ -436,12 +508,13 @@ def vehicle_history(
 )
 def route_history(
     route_id: str,
+    feed: FeedDependency,
     session: SessionDependency,
     start: datetime | None = Query(default=None),
     end: datetime | None = Query(default=None),
     limit: int = Query(default=1000, ge=1, le=5000),
-    feed_id: UUID | None = Query(default=None),
 ) -> HistoryVehicleObservationCollection:
+    route_for_feed(session, feed, route_id)
     window_start, window_end = history_window(start, end)
     return history_collection(
         session,
@@ -449,7 +522,7 @@ def route_history(
         end=window_end,
         limit=limit,
         route_id=route_id,
-        feed_id=feed_id,
+        static_feed_id=feed.id,
     )
 
 

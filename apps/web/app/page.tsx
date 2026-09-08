@@ -13,6 +13,15 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Feature, FeatureCollection, LineString, Point } from "geojson";
 
+import {
+  advanceReplayTimestamp,
+  clampReplayTimestamp,
+  replayFrameAt,
+  replayTimestampAtFraction,
+  vehicleDataForMode,
+  type ReplayMode,
+} from "./replay";
+
 type ServiceStatus = "loading" | "online" | "offline";
 type NetworkState = "loading" | "ready" | "empty" | "error";
 
@@ -70,6 +79,39 @@ interface RealtimeVehicleCollection extends GeoJsonFeatureCollection {
   features: Array<Feature<Point, VehicleProperties>>;
   source_timestamp: string | null;
   stale: boolean;
+}
+
+interface HistoricalVehicleProperties {
+  observation_id: number;
+  static_feed_id: string;
+  vehicle_id: string;
+  trip_id: string | null;
+  route_id: string | null;
+  observed_at: string | null;
+  source_timestamp: string | null;
+  recorded_at: string;
+  bearing: number | null;
+  speed: number | null;
+  current_stop_sequence: number | null;
+  current_status: string | null;
+  schedule_relationship: string | null;
+  delay_seconds: number | null;
+}
+
+interface HistoryVehicleObservationCollection {
+  type: "FeatureCollection";
+  static_feed_id: string;
+  features: Array<Feature<Point, HistoricalVehicleProperties>>;
+  start: string;
+  end: string;
+  limit: number;
+}
+
+interface HistoryAvailability {
+  static_feed_id: string;
+  first_observed_at: string | null;
+  last_observed_at: string | null;
+  observation_count: number;
 }
 
 interface RouteOperations {
@@ -242,6 +284,20 @@ function formatSeconds(value: number | null): string {
   return `${Math.round(value / 60)} min`;
 }
 
+function formatReplayTime(value: string | null): string {
+  if (!value) return "No recorded history";
+  return new Intl.DateTimeFormat("en-CA", {
+    dateStyle: "medium",
+    timeStyle: "medium",
+  }).format(new Date(value));
+}
+
+function toDateTimeLocalValue(value: string): string {
+  const date = new Date(value);
+  const pad = (number: number) => String(number).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 export default function Home() {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<Map | null>(null);
@@ -265,6 +321,15 @@ export default function Home() {
   const [selectedVehicleId, setSelectedVehicleId] = useState<string | null>(null);
   const [operations, setOperations] = useState<RouteOperations | null>(null);
   const [routeAlerts, setRouteAlerts] = useState<RealtimeAlert[]>([]);
+  const [mode, setMode] = useState<ReplayMode>("live");
+  const [replayAvailability, setReplayAvailability] = useState<HistoryAvailability | null>(null);
+  const [replayHistory, setReplayHistory] = useState<HistoryVehicleObservationCollection | null>(null);
+  const [replayStart, setReplayStart] = useState<string | null>(null);
+  const [replayEnd, setReplayEnd] = useState<string | null>(null);
+  const [replayTimestamp, setReplayTimestamp] = useState<string | null>(null);
+  const [replaySpeed, setReplaySpeed] = useState(1);
+  const [replayPlaying, setReplayPlaying] = useState(false);
+  const [replayMessage, setReplayMessage] = useState("");
 
   useEffect(() => {
     const abortController = new AbortController();
@@ -307,6 +372,7 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    if (mode !== "live") return;
     let alive = true;
     const endpoint = selectedRouteId
       ? `/api/realtime/routes/${encodeURIComponent(selectedRouteId)}/vehicles`
@@ -327,7 +393,111 @@ export default function Home() {
     refreshVehicles();
     const timer = window.setInterval(refreshVehicles, 15_000);
     return () => { alive = false; window.clearInterval(timer); };
-  }, [selectedRouteId]);
+  }, [mode, selectedRouteId]);
+
+  useEffect(() => {
+    if (mode !== "replay") return;
+    const abortController = new AbortController();
+    const params = new URLSearchParams();
+    if (selectedRouteId) params.set("route_id", selectedRouteId);
+    void fetchJson<HistoryAvailability>(`/api/history/availability?${params.toString()}`, abortController.signal)
+      .then((availability) => {
+        if (!availability.first_observed_at || !availability.last_observed_at) {
+          setReplayAvailability(availability);
+          setReplayHistory(null);
+          setReplayMessage("No recorded vehicle positions are available for this selection.");
+          return;
+        }
+        const first = Date.parse(availability.first_observed_at);
+        const last = Date.parse(availability.last_observed_at);
+        const start = new Date(Math.max(first, last - 5 * 60_000)).toISOString();
+        const end = new Date(last).toISOString();
+        setReplayAvailability(availability);
+        setReplayStart(start);
+        setReplayEnd(end);
+        setReplayTimestamp(end);
+        setReplayMessage(`${availability.observation_count.toLocaleString()} recorded positions are available for this static feed.`);
+      })
+      .catch((error: unknown) => {
+        if (abortController.signal.aborted) return;
+        setReplayAvailability(null);
+        setReplayHistory(null);
+        setReplayMessage(error instanceof Error ? error.message : "Recorded history could not be loaded.");
+      });
+    return () => abortController.abort();
+  }, [mode, selectedRouteId]);
+
+  useEffect(() => {
+    if (mode !== "replay" || !replayStart || !replayEnd) return;
+    const abortController = new AbortController();
+    const params = new URLSearchParams({ start: replayStart, end: replayEnd, limit: "5000" });
+    if (selectedRouteId) params.set("route_id", selectedRouteId);
+    void fetchJson<HistoryVehicleObservationCollection>(`/api/history/observations?${params.toString()}`, abortController.signal)
+      .then((history) => {
+        if (abortController.signal.aborted) return;
+        setReplayHistory(history);
+        setReplayTimestamp((current) => {
+          const start = Date.parse(history.start);
+          const end = Date.parse(history.end);
+          return new Date(clampReplayTimestamp(current ? Date.parse(current) : end, start, end)).toISOString();
+        });
+        setReplayMessage(history.features.length ? `${history.features.length.toLocaleString()} bounded observations loaded for replay.` : "No positions were recorded in this window.");
+      })
+      .catch((error: unknown) => {
+        if (!abortController.signal.aborted) {
+          setReplayHistory(null);
+          setReplayMessage(error instanceof Error ? error.message : "Replay window could not be loaded.");
+        }
+      });
+    return () => abortController.abort();
+  }, [mode, replayEnd, replayStart, selectedRouteId]);
+
+  useEffect(() => {
+    if (!replayPlaying || !replayTimestamp || !replayStart || !replayEnd) return;
+    const start = Date.parse(replayStart);
+    const end = Date.parse(replayEnd);
+    const timer = window.setInterval(() => {
+      setReplayTimestamp((current) => {
+        if (!current) return current;
+        const next = advanceReplayTimestamp(Date.parse(current), 250, replaySpeed, start, end);
+        if (next >= end) setReplayPlaying(false);
+        return new Date(next).toISOString();
+      });
+    }, 250);
+    return () => window.clearInterval(timer);
+  }, [replayEnd, replayPlaying, replaySpeed, replayStart, replayTimestamp]);
+
+  const replayVehicles = useMemo<RealtimeVehicleCollection | null>(() => {
+    if (!replayHistory || !replayTimestamp) return null;
+    const frame = replayFrameAt(
+      replayHistory.features,
+      Date.parse(replayTimestamp),
+      replayHistory.static_feed_id,
+    );
+    return {
+      type: "FeatureCollection",
+      feed_id: replayHistory.static_feed_id,
+      source_timestamp: replayTimestamp,
+      stale: false,
+      features: frame.map((feature) => ({
+        type: "Feature",
+        geometry: feature.geometry,
+        properties: {
+          vehicle_id: feature.properties.vehicle_id,
+          trip_id: feature.properties.trip_id,
+          route_id: feature.properties.route_id,
+          bearing: feature.properties.bearing,
+          speed: feature.properties.speed,
+          timestamp: feature.properties.observed_at ?? feature.properties.source_timestamp ?? feature.properties.recorded_at,
+          current_stop_sequence: feature.properties.current_stop_sequence,
+          current_status: feature.properties.current_status,
+          schedule_relationship: feature.properties.schedule_relationship,
+          delay_seconds: feature.properties.delay_seconds,
+        },
+      })),
+    };
+  }, [replayHistory, replayTimestamp]);
+  const displayedVehicles = vehicleDataForMode(mode, vehicles, replayVehicles);
 
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) return;
@@ -449,8 +619,8 @@ export default function Home() {
   useEffect(() => {
     if (!mapLoaded) return;
     const source = mapRef.current?.getSource("live-vehicles") as GeoJSONSource | undefined;
-    source?.setData(asFeatureCollection(vehicles));
-  }, [mapLoaded, vehicles]);
+    source?.setData(asFeatureCollection(displayedVehicles));
+  }, [displayedVehicles, mapLoaded]);
 
   useEffect(() => {
     if (!selectedRouteId) {
@@ -516,10 +686,22 @@ export default function Home() {
     });
   }, [filter, routes, search]);
   const selectedVehicle = useMemo(
-    () => vehicles?.features.find((feature) => feature.properties?.vehicle_id === selectedVehicleId)?.properties ?? null,
-    [selectedVehicleId, vehicles],
+    () => displayedVehicles?.features.find((feature) => feature.properties?.vehicle_id === selectedVehicleId)?.properties ?? null,
+    [displayedVehicles, selectedVehicleId],
   );
   const vehicleFeed = feedStatus(realtimeStatus, "vehicle_positions");
+  const replayProgress = useMemo(() => {
+    if (!replayStart || !replayEnd || !replayTimestamp) return 0;
+    const start = Date.parse(replayStart);
+    const end = Date.parse(replayEnd);
+    return end > start ? ((Date.parse(replayTimestamp) - start) / (end - start)) * 1000 : 0;
+  }, [replayEnd, replayStart, replayTimestamp]);
+  const updateMode = (nextMode: ReplayMode) => {
+    setMode(nextMode);
+    setReplayPlaying(false);
+    setSelectedVehicleId(null);
+    if (nextMode === "live") setReplayMessage("");
+  };
 
   return (
     <main className="transit-shell">
@@ -529,26 +711,87 @@ export default function Home() {
           networkShapes={networkShapes}
           selectedShapes={selectedShapes}
           selectedStops={selectedStops}
-          vehicles={vehicles}
+          vehicles={displayedVehicles}
         />
         <div className="map-brand">
           <span className="pulse-mark" aria-hidden="true">●</span>
           <div><strong>TransitPulse</strong><span>Edmonton live operations</span></div>
         </div>
-        <div className="map-legend"><span className="legend-line" /> Static network <span className="legend-vehicle" /> Live vehicles</div>
+        <div className="map-legend"><span className="legend-line" /> Static network <span className="legend-vehicle" /> {mode === "replay" ? "Replay vehicles" : "Live vehicles"}</div>
       </section>
 
       <aside className="route-sidebar">
         <header className="sidebar-header">
-          <p className="eyebrow">LIVE OPERATIONS</p>
+          <p className="eyebrow">{mode === "replay" ? "HISTORICAL REPLAY" : "LIVE OPERATIONS"}</p>
           <h1>Explore Edmonton transit</h1>
           <p className={`network-status ${networkState}`}>{networkMessage}</p>
-          <p className={`realtime-status ${realtimeStatus?.stale ? "stale" : ""}`}>
-            <i className={`status-dot ${realtimeStatus && !realtimeStatus.stale ? "online" : "offline"}`} />
-            {realtimeStatus?.stale ? "Live feed stale" : `${realtimeStatus?.active_vehicles ?? 0} live vehicles`}
-            <small> · updated {formatRealtimeTime(vehicleFeed?.source_timestamp ?? vehicleFeed?.last_success_at)}</small>
-          </p>
+          {mode === "replay" ? (
+            <p className="realtime-status"><i className="status-dot online" /> {displayedVehicles?.features.length ?? 0} replay vehicles <small> · {formatReplayTime(replayTimestamp)}</small></p>
+          ) : (
+            <p className={`realtime-status ${realtimeStatus?.stale ? "stale" : ""}`}>
+              <i className={`status-dot ${realtimeStatus && !realtimeStatus.stale ? "online" : "offline"}`} />
+              {realtimeStatus?.stale ? "Live feed stale" : `${realtimeStatus?.active_vehicles ?? 0} live vehicles`}
+              <small> · updated {formatRealtimeTime(vehicleFeed?.source_timestamp ?? vehicleFeed?.last_success_at)}</small>
+            </p>
+          )}
         </header>
+
+        <section className="replay-controls" aria-label="Historical playback controls">
+          <div className="mode-switch" aria-label="Transit data mode">
+            <button className={mode === "live" ? "active" : ""} onClick={() => updateMode("live")} type="button">Live</button>
+            <button className={mode === "replay" ? "active" : ""} onClick={() => updateMode("replay")} type="button">Replay</button>
+          </div>
+          {mode === "replay" && <>
+            <p className="replay-availability">
+              {replayAvailability?.first_observed_at && replayAvailability.last_observed_at
+                ? <>Available: {formatReplayTime(replayAvailability.first_observed_at)} – {formatReplayTime(replayAvailability.last_observed_at)}</>
+                : "Loading available recorded history…"}
+            </p>
+            {replayAvailability?.first_observed_at && replayAvailability.last_observed_at && replayStart && replayEnd && <div className="replay-date-grid">
+              <label>From<input aria-label="Replay start" type="datetime-local" min={toDateTimeLocalValue(replayAvailability.first_observed_at)} max={toDateTimeLocalValue(replayAvailability.last_observed_at)} value={toDateTimeLocalValue(replayStart)} onChange={(event) => {
+                const next = new Date(event.target.value);
+                if (Number.isNaN(next.valueOf())) return;
+                setReplayPlaying(false);
+                setReplayStart(next.toISOString());
+                setReplayTimestamp((current) => current && Date.parse(current) < next.valueOf() ? next.toISOString() : current);
+              }} /></label>
+              <label>To<input aria-label="Replay end" type="datetime-local" min={toDateTimeLocalValue(replayAvailability.first_observed_at)} max={toDateTimeLocalValue(replayAvailability.last_observed_at)} value={toDateTimeLocalValue(replayEnd)} onChange={(event) => {
+                const next = new Date(event.target.value);
+                if (Number.isNaN(next.valueOf())) return;
+                setReplayPlaying(false);
+                setReplayEnd(next.toISOString());
+                setReplayTimestamp((current) => current && Date.parse(current) > next.valueOf() ? next.toISOString() : current);
+              }} /></label>
+            </div>}
+            <p className="replay-clock">Replay time <strong>{formatReplayTime(replayTimestamp)}</strong></p>
+            <input aria-label="Replay timeline" className="replay-timeline" disabled={!replayStart || !replayEnd || !replayTimestamp} max="1000" min="0" onChange={(event) => {
+              if (!replayStart || !replayEnd) return;
+              setReplayPlaying(false);
+              const next = replayTimestampAtFraction(Number(event.target.value) / 1000, Date.parse(replayStart), Date.parse(replayEnd));
+              setReplayTimestamp(new Date(next).toISOString());
+            }} type="range" value={Math.round(replayProgress)} />
+            <div className="replay-actions">
+              <button aria-label="Jump backward 30 seconds" disabled={!replayTimestamp || !replayStart || !replayEnd} onClick={() => {
+                if (!replayTimestamp || !replayStart || !replayEnd) return;
+                setReplayPlaying(false);
+                setReplayTimestamp(new Date(clampReplayTimestamp(Date.parse(replayTimestamp) - 30_000, Date.parse(replayStart), Date.parse(replayEnd))).toISOString());
+              }} type="button">−30s</button>
+              <button className="primary" disabled={!replayHistory?.features.length} onClick={() => {
+                if (replayTimestamp && replayStart && replayEnd && Date.parse(replayTimestamp) >= Date.parse(replayEnd)) setReplayTimestamp(replayStart);
+                setReplayPlaying((playing) => !playing);
+              }} type="button">{replayPlaying ? "Pause" : "Play"}</button>
+              <button aria-label="Jump forward 30 seconds" disabled={!replayTimestamp || !replayStart || !replayEnd} onClick={() => {
+                if (!replayTimestamp || !replayStart || !replayEnd) return;
+                setReplayPlaying(false);
+                setReplayTimestamp(new Date(clampReplayTimestamp(Date.parse(replayTimestamp) + 30_000, Date.parse(replayStart), Date.parse(replayEnd))).toISOString());
+              }} type="button">+30s</button>
+            </div>
+            <div className="speed-row" aria-label="Replay speed">
+              {[1, 5, 20, 60].map((speed) => <button className={replaySpeed === speed ? "active" : ""} key={speed} onClick={() => setReplaySpeed(speed)} type="button">{speed}x</button>)}
+            </div>
+            {replayMessage && <p className="replay-message">{replayMessage}</p>}
+          </>}
+        </section>
 
         <div className="route-controls">
           <label className="search-label" htmlFor="route-search">Search routes</label>
@@ -588,7 +831,7 @@ export default function Home() {
             <h2>{routeLabel(selectedRoute)}</h2>
             <p>{selectedRoute.description ?? "Static schedule geometry and stops from the selected GTFS feed."}</p>
             <dl><div><dt>Agency</dt><dd>{selectedRoute.agency_name}</dd></div><div><dt>Feed version</dt><dd title={selectedRoute.feed_id}>{selectedRoute.feed_id.slice(0, 8)}</dd></div></dl>
-            <div className="operations-summary">
+            {mode === "replay" ? <p className="replay-route-note">Static route details remain selected. Current live operations are deliberately hidden while recorded positions are replaying.</p> : <div className="operations-summary">
               <div className={`service-state ${operations?.service_status?.toLowerCase().replaceAll("_", "-") ?? "no-live-data"}`}>
                 <span>Service status</span><strong>{operations?.service_status?.replaceAll("_", " ") ?? "NO LIVE DATA"}</strong>
               </div>
@@ -600,7 +843,7 @@ export default function Home() {
               <p className="operations-reason">{operations?.status_reason ?? "Loading current route operations…"}</p>
               {operations?.headway_baseline_seconds !== null && operations?.headway_baseline_seconds !== undefined && <p className="headway-note">Predicted headways at stop {operations.prediction_stop_id ?? "—"}: {operations.predicted_headways_seconds.map((value) => formatSeconds(value)).join(", ")} (baseline {formatSeconds(operations.headway_baseline_seconds)})</p>}
               {routeAlerts.length > 0 && <div className="route-alerts">{routeAlerts.slice(0, 2).map((alert) => <p key={alert.id}><strong>Alert:</strong> {alert.header ?? alert.description ?? "Service disruption"}</p>)}</div>}
-            </div>
+            </div>}
           </>}
         </section>
 

@@ -32,5 +32,7 @@ def make_gtfs_archive(
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zipped:
         for name, contents in contents.items():
             if name not in omitted:
-                zipped.writestr(name, contents)
+                entry = zipfile.ZipInfo(name, date_time=(2026, 9, 8, 0, 0, 0))
+                entry.compress_type = zipfile.ZIP_DEFLATED
+                zipped.writestr(entry, contents)
     return buffer.getvalue()
