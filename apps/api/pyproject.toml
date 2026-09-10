@@ -32,4 +32,4 @@ testpaths = ["tests"]
 addopts = "-ra"
 
 [tool.setuptools.packages.find]
-include = ["transitpulse_api*"]
+include = ["transitpulse_api*", "transitpulse_ml*"]

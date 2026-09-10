@@ -7,6 +7,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from transitpulse_api.database import get_engine
+from transitpulse_api.database_safety import validated_disposable_test_url
 from transitpulse_api.config import settings
 from transitpulse_api.main import app
 
@@ -18,7 +19,7 @@ _test_database_url = os.getenv("TRANSITPULSE_TEST_DATABASE_URL")
 # a multi-million-row GTFS import and recorded observations.  CI explicitly
 # opts in because its PostGIS service is disposable.
 if _test_database_url:
-    settings.database_url = _test_database_url
+    settings.database_url = str(validated_disposable_test_url(_test_database_url))
     get_engine.cache_clear()
 
 
@@ -33,7 +34,7 @@ def database_ready() -> None:
     """Skip integration coverage only when the configured native DB is unavailable."""
 
     global _database_unavailable_reason
-    if not _test_database_url and os.getenv("TRANSITPULSE_ALLOW_DESTRUCTIVE_TEST_DB") != "1":
+    if not _test_database_url:
         pytest.skip(
             "integration tests require TRANSITPULSE_TEST_DATABASE_URL; refusing to truncate the application database"
         )
@@ -41,6 +42,14 @@ def database_ready() -> None:
         pytest.skip(_database_unavailable_reason)
     try:
         with get_engine().connect() as connection:
+            expected_database = validated_disposable_test_url(_test_database_url).database
+            actual_database = connection.execute(
+                text("SELECT current_database()")
+            ).scalar_one()
+            if actual_database != expected_database:
+                pytest.fail(
+                    "connected database identity does not match TRANSITPULSE_TEST_DATABASE_URL"
+                )
             connection.execute(text("SELECT PostGIS_Version()"))
             if connection.execute(text("SELECT to_regclass('public.vehicle_observations')")).scalar_one() is None:
                 _database_unavailable_reason = "TransitPulse migrations have not been applied to the configured database"

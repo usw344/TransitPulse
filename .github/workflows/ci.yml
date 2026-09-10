@@ -11,19 +11,19 @@ jobs:
       postgres:
         image: postgis/postgis:17-3.5
         env:
-          POSTGRES_DB: transitpulse
+          POSTGRES_DB: transitpulse_test
           POSTGRES_USER: transitpulse
           POSTGRES_PASSWORD: transitpulse
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U transitpulse -d transitpulse"
+          --health-cmd "pg_isready -U transitpulse -d transitpulse_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
     env:
-      TRANSITPULSE_DATABASE_URL: postgresql+psycopg://transitpulse:transitpulse@localhost:5432/transitpulse
-      TRANSITPULSE_ALLOW_DESTRUCTIVE_TEST_DB: "1"
+      TRANSITPULSE_DATABASE_URL: postgresql+psycopg://transitpulse:transitpulse@localhost:5432/transitpulse_test
+      TRANSITPULSE_TEST_DATABASE_URL: postgresql+psycopg://transitpulse:transitpulse@localhost:5432/transitpulse_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
