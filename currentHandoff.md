@@ -7,7 +7,7 @@
 
 ## Current product state
 
-- Existing product: Edmonton LIVE, REPLAY, and ANALYTICS implementation is present in a dirty working tree. Verified ML recovery/audit foundation is committed at `0e585a5`; tested segment-label primitives are committed at `6bac0c6` (`main`, four local commits ahead of `origin/main` before this final handoff-only commit).
+- Existing product: Edmonton LIVE, REPLAY, and ANALYTICS implementation is present in a dirty working tree. Verified ML recovery/audit foundation is committed at `0e585a5`; tested segment-label primitives at `6bac0c6`; the finalized handoff at `2f36a66`; and the run archive through `c743b77`. Check `git status --short --branch` for the live ahead count.
 - Do not discard or overwrite the pre-existing uncommitted application/test changes. They are the user's work/current product continuation state.
 - MODEL LAB has not been implemented and must not be represented as real yet.
 
