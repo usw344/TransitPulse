@@ -47,3 +47,40 @@
 ## 2026-09-07 — worklog audit correction
 
 - Read the full log against current code. Earlier statements that port 5432 was closed and no native PostgreSQL client existed were true at their timestamps; this run temporarily started a project-local PostgreSQL 18.6 server to prove connectivity, then stopped it. The current blocker is specifically missing PostGIS extension files, not PostgreSQL reachability. No migration/endpoint mismatch found; the historical test counts remain historical, while current verification is 11 passed / 9 skipped.
+
+## 2026-09-07 — native PostGIS import and launcher correction
+
+- Fixed GTFS `stops.txt` validation to follow `location_type`: `stop_name`, `stop_lat`, and `stop_lon` remain required for types 0/1/2 and are optional for generic nodes/boarding areas (3/4); parent hierarchy and stop-time platform references are now also validated. Edmonton row 6258 (`E10`, type 3, blank name) and 40 equivalent valid nodes import unchanged. Deterministic tests cover permitted/rejected blank names, the Edmonton row, conditional parents/coordinates, and existing malformed inputs.
+- Fixed `START_TRANSITPULSE.bat` bootstrap order: it separately checks PostgreSQL reachability and server-side PostGIS files, runs Alembic (where 0001 enables PostGIS), then verifies the extension is active. The readiness HTTP probes bypass Windows PowerShell's localhost proxy behavior and failure paths identify PostgreSQL, extension files, migration, GTFS, backend, and frontend failures. A temporary clean database proved PostGIS is inactive before migration and active after it; the test database was removed without touching the populated TransitPulse database.
+- Real official Edmonton import succeeded: 7 agencies, 242 routes, 6,791 stops, 86,754 trips, 2,786,938 stop times, and 657 shapes. All 27 backend tests (including PostGIS integration) passed in the isolated database; frontend typecheck and production build passed. `START_TRANSITPULSE.bat` completed, rendered 242 routes and route 001A's 54 stops, and the realtime recorder successfully ingested 146 vehicles, 835 trip updates, and 85 alerts and recorded 146 observations. Remaining issues: none known.
+
+## 2026-09-08 — Stage 0 visual/runtime correction
+
+- Diagnosed this host's blank MapLibre canvas as a graphics-process failure, not missing GTFS data. The normal map keeps the Carto/OpenStreetMap MapLibre basemap; an SVG fallback renders the same API-provided 657 static GTFS shapes, selected route geometry/stops, and live vehicle GeoJSON so the map remains useful without working WebGL. Sidebar panels are bounded and independently scrollable, eliminating footer/detail overlap.
+- An earlier local integration run exposed that fixtures truncated the application database. The official Edmonton feed was restored via `START_TRANSITPULSE.bat`; fixtures now require `TRANSITPULSE_TEST_DATABASE_URL` unless an explicit disposable-CI opt-in is set. Dedicated `transitpulse_test` migrations plus the full suite passed (27), while the default safe run reports 17 passed / 10 skipped.
+- Runtime recheck: 242 routes, 657 shapes, 376 live vehicles, and route 001A's 3 shapes / 54 stops. Independent Stage 0 supervisor verdict: PASS.
+
+## 2026-09-08 — M7 historical replay
+
+- Added feed-consistent history availability and bounded observation endpoints. Replay requests are restricted to the current static feed, a maximum 24-hour window, and 5,000 source observations; route and vehicle filters are supported without permitting cross-feed results.
+- Added Live/Replay controls with date-time bounds, timeline scrubbing, ±30-second jumps, play/pause, and 1×/5×/20×/60× speeds. The map renders only the latest source record at or before the playhead, hides vehicles after a two-minute source gap, and never interpolates or invents locations. Current live operations are hidden in replay mode.
+- Runtime proof: route 004 loaded 133 bounded recorded observations from the current feed, selected-route geometry/stops remained visible, backward scrubbing and 60× playback worked, and Live restored current operations. Full backend suite: 28 passed; replay helpers: 5 passed; typecheck and production build passed. Independent M7 supervisor verdict: PASS.
+
+## 2026-09-09 — Operations product pass, Stage 1 and M8
+
+- Reworked the web product into explicit LIVE / REPLAY / ANALYTICS modes with a network KPI strip, balanced map/workspace layout, searchable status-aware route list, route inspector, ranked issue and publisher-alert surfaces, and preserved M7 playback. Browser checks at 1920×1080 and 1440×900 found no document overflow or overlapping controls. Independent Stage 1 supervisor verdict: PASS.
+- Added bounded, feed-scoped route reliability analytics: observed vehicles, delay percentiles/bands, scheduled vs observed headways, variability, bunching/gaps, time buckets, best/worst periods, stop-level reliability evidence, coverage, and explicit configured sufficiency gates. Unsupported low-sample estimates are withheld in both analytics surfaces.
+- Deterministic coverage includes calculations, sparse/empty windows, 24-hour/10,000-row bounds, and overlapping route/trip identifiers across static feeds. Independent M8 review reproduced route 705 UI/API values from raw SQL and returned PASS.
+
+## 2026-09-09 — M9 network health and historical comparison
+
+- Added one network-health endpoint for active vehicles/routes, late routes, bunching, gaps, alerts, median delay, and a bounded ranked issue queue. Early running is distinct from late delay; stale snapshots withhold current KPIs/issues instead of ranking old state. Route/alert selection focuses route geometry and opens a live-refreshed evidence summary.
+- GTFS-Realtime alerts expose publisher effect, affected routes, active periods, and route navigation without invented severity. Route-list status lookup is map-backed rather than repeated linear scans.
+- Added bounded two-period route comparison with median/P90 delay, observed/scheduled headway evidence, variability, bunching, gaps, observations, coverage, B−A deltas, an explainable verdict, and a 75% recorded/requested coverage guard that refuses a winner when comparison quality is inadequate.
+- Current automated verification: 40 dedicated PostGIS backend tests, 3 analytics UI-gate tests, 5 replay tests, frontend typecheck, and production build passed with no skipped tests in the dedicated suite. Real Edmonton route 705 comparison used two six-hour windows (1,300 vs 1,167 observations; 82.4% coverage match); live network refresh exposed 559 vehicles, 150 routes with service, 24 bunching routes, 25 gap routes, and 79 publisher alerts at the sampled instant.
+
+## 2026-09-10 — ML program recovery and data-audit gates
+
+- Migrated continuation to `currentHandoff.md`, persisted the four Luna roles and gates in `SUPERVISOR.md`, and hardened destructive integration tests so only an explicitly named disposable test database can be truncated; Gate 0 Software/QA Luna PASS.
+- Added a reproducible read-only database audit and official external-source register. Snapshot evidence found 729,477 observations across 51.910 elapsed hours but only about 19.76 observed hours, with two long outages and 97.7971% exact static trip/stop-sequence eligibility. Both Gate 1 ML and Transit Luna critics PASS the honest insufficient-history judgment and narrow consecutive-stop operational travel-time target.
+- Added the first SQL-independent shape-projection/interpolated-crossing primitives with six synthetic tests (11 focused tests total). No dataset, baseline, deep model, simulator, or optimizer is claimed; Gate 2 awaits a bounded service-day-aware database extractor, quality census, manifest, and real smoke artifact.
