@@ -7,7 +7,7 @@
 
 ## Current product state
 
-- Existing product: Edmonton LIVE, REPLAY, and ANALYTICS implementation is present in a dirty working tree based on commit `4296614` (`main`, two local commits ahead of `origin/main`).
+- Existing product: Edmonton LIVE, REPLAY, and ANALYTICS implementation is present in a dirty working tree. Verified ML recovery/audit foundation is committed at `0e585a5` (`main`, three local commits ahead of `origin/main` before the final segment-primitives checkpoint).
 - Do not discard or overwrite the pre-existing uncommitted application/test changes. They are the user's work/current product continuation state.
 - MODEL LAB has not been implemented and must not be represented as real yet.
 
@@ -39,8 +39,9 @@
 
 ## ML dataset state
 
-- Not started. Target candidate is prediction of directed stop-to-stop/route-segment travel time using only information available at prediction time.
-- No dataset ID, registry entry, split, or persisted model-ready artifact exists yet.
+- Gate 1 approved target: directed consecutive-scheduled-stop arrival-to-arrival travel time on a feed/trip/route variant, inferred by shape projection/interpolated crossings and using only information available at prediction time.
+- `transitpulse_ml.segments` now contains SQL-independent polyline projection and traversal-label primitives. Synthetic tests cover sparse GTFS sequences, interpolation, deterministic duplicate timestamps, unmatched sequences, vehicle-progress regression, excessive bracketing gaps, and basic lateral projection.
+- This is not yet a model-ready dataset. No database streaming/run grouping, service-day/midnight handling, ambiguity census, dataset ID/manifest, split, or persisted smoke rows exist. Gate 2 is not ready for review.
 
 ## Current model / experiment state
 
@@ -63,12 +64,14 @@
 - Gate 1 DATA AUDIT / MODEL TARGET: PASS (independent ML Luna and Transit Luna; reproducible sparse-coverage judgment, static referential eligibility, external-source limitations, and narrow operational target verified).
 - Gates 2–7: not reached.
 - Test isolation guard: 5 focused unit tests pass; health integration tests skip without an explicit `*_test`/`test_*` database URL. The former destructive opt-in bypass was removed and CI now provisions `transitpulse_test`.
+- Phase 2 primitives: 6 segment tests pass; combined audit/safety/segment suite is 11 passed. No Gate 2 critic review has been requested because required real extraction evidence is absent.
 
 ## Known problems
 
 - The working tree contains substantial pre-existing uncommitted LIVE/REPLAY/ANALYTICS changes; commits must avoid accidentally misattributing or losing them.
 - Observation history is sparse and discontinuous, with fewer than 30 usable days; deep learning is not currently justified.
 - Process command lines could not be inspected because Windows denied CIM access. PostgreSQL is reachable. Observation count/latest time advanced from 725,843 at 00:14:43 to 726,549 at 00:18:14, which is affirmative recorder-liveness evidence. Frontend `http://127.0.0.1:3000` returned HTTP 200; API `http://127.0.0.1:8000/health` refused the connection. No ML training or optimization job has been launched by this run.
+- Segment primitives do not yet prove loop/repeated-stop ambiguity handling, service-day identity for after-midnight trips, terminal/layover exclusion, or scalable database extraction. Do not treat them as a dataset pipeline.
 
 ## Failed approaches not to repeat
 
@@ -80,9 +83,9 @@
 
 ## Exact next action
 
-1. Implement the route/trip/shape-aware directed segment graph and traversal extractor. Order GTFS stop-times by their actual sparse `stop_sequence` values; never assume sequence increments of one.
-2. Quantify/reject unmatched feed/trip/stop sequences, duplicate/regressive timestamps, trip/service-day changes, nonmonotonic progression, large observation gaps, skipped/repeated stops, terminal/layover transitions, implausible speeds, excessive shape distance, and ambiguous route variants. Treat omitted GTFS-RT `current_status` according to the specification, never as observed arrival/stopped evidence.
-3. Persist a small versioned smoke dataset manifest/checksum and deterministic synthetic edge-case tests, then request Gate 2 ML and Transit Luna reviews. Do not train or split models before Gate 2 PASS.
+1. Add a bounded, read-only, streaming database extractor around `transitpulse_ml.segments`. Group observations by static feed, trip, vehicle, and correctly derived GTFS service day; use the actual ordered sparse stop sequences and route shape.
+2. Add loop/repeated-stop ambiguity detection, terminal/layover and midnight tests, per-rejection quality counters, and a real small-window smoke run. Do not relax rejections merely to increase row count.
+3. Persist the smoke rows under ignored `artifacts/datasets/<dataset-id>/` with a manifest containing source bounds/feed IDs/schema/label/filter thresholds/quality counts/row-segment-route counts/chronological period placeholders/checksum. Then request Gate 2 ML and Transit Luna reviews. Do not train or split models before Gate 2 PASS.
 
 ## Commands to continue
 
@@ -92,6 +95,7 @@ Get-Content -Raw SUPERVISOR.md
 git status --short --branch
 .\.venv\Scripts\python.exe scripts/audit_ml_data.py --output artifacts/data-audits/latest.json
 Get-Content -Raw artifacts/data-audits/latest.json
+.\.venv\Scripts\python.exe -m pytest apps/api/tests/test_ml_segments.py apps/api/tests/test_ml_audit.py apps/api/tests/test_database_safety.py -q
 ```
 
 Do not read all of `WORKLOG.md` unless recovery genuinely requires historical context.
