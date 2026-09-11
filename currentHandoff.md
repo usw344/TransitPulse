@@ -10,7 +10,7 @@
 - Existing product: Edmonton LIVE, REPLAY, and ANALYTICS implementation is present in a dirty working tree. Verified ML recovery/audit foundation is committed at `0e585a5`; tested segment-label primitives at `6bac0c6`; the finalized handoff at `2f36a66`; and the run archive through `c743b77`. Check `git status --short --branch` for the live ahead count.
 - Do not discard or overwrite the pre-existing uncommitted application/test changes. They are the user's work/current product continuation state.
 - MODEL LAB has not been implemented and must not be represented as real yet.
-- M0 — REACHED. Independent Luna Software/QA PASS: `git diff --check` clean; full API suite is 51 passed against explicit disposable `transitpulse_test` PostGIS after migration; frontend typecheck/build pass; analytics tests 3 passed; replay tests 5 passed; no secrets/generated artifacts found. The test fixture now keeps the approved disposable URL credential only in memory rather than converting it to masked `***`. Migration 0005 guards its downgrade against legitimate null stop locations and requires explicit remediation.
+- M0 — REACHED. Independent Luna Software/QA PASS: `git diff --check` clean; full API suite is 51 passed against explicit disposable `transitpulse_test` PostGIS after migration; frontend typecheck/build pass; analytics tests 3 passed; replay tests 5 passed; no secrets/generated artifacts found. The test fixture now keeps the approved disposable URL credential only in memory rather than converting it to masked `***`. Migration 0005 guards its downgrade against legitimate null stop locations and requires explicit remediation. Checkpoint commit: `dd08938`.
 - M1 — REACHED. At 2026-09-10 21:07 America/Regina, the supported launcher (run with network permission) verified PostgreSQL, PostGIS, migrations, and GTFS, then started API PID 15712 and recorder PID 21928 hidden. Windows denied command-line inspection, so process roles are evidenced by launcher order, API HTTP 200, and recorder log/status behavior. The prior failed recorder was PID 24916 (command line unavailable; it remained alive after API PID 17260 was stopped and kept reporting socket error 10013); it was terminated before launcher recovery. One short-lived attempted replacement, PID 34996, exited because the old process held `realtime.log` open. The existing `transitpulse_api.realtime_recorder` entry point now uses bounded rotation when given `--log-file`: 2,000,000 bytes plus 3 backups. Successful ETS polls at 21:07:57, 21:08:29, 21:09:00, and 21:09:32 reported 264 vehicle positions, 1,196/1,185/1,187/1,187 trip updates, and 90 alerts with no status errors. Immutable observations advanced 821,782 at 21:07:25 → 822,046 at 21:08:24 → 822,574 at 21:09:25. API `/health/db` and web each returned HTTP 200 after the second interval. `\.transitpulse-logs\realtime.log` is ignored and bounded by rotation.
 
 ## Current architecture
@@ -43,7 +43,8 @@
 
 - Gate 1 approved target: directed consecutive-scheduled-stop arrival-to-arrival travel time on a feed/trip/route variant, inferred by shape projection/interpolated crossings and using only information available at prediction time.
 - `transitpulse_ml.segments` now contains SQL-independent polyline projection and traversal-label primitives. Synthetic tests cover sparse GTFS sequences, interpolation, deterministic duplicate timestamps, unmatched sequences, vehicle-progress regression, excessive bracketing gaps, and basic lateral projection.
-- This is not yet a model-ready dataset. No database streaming/run grouping, service-day/midnight handling, ambiguity census, dataset ID/manifest, split, or persisted smoke rows exist. Gate 2 is not ready for review.
+- `transitpulse_ml.service_day` is now in progress with tested normal and >24:00 GTFS service-day resolution plus calendar exception handling; it is not connected to database extraction yet.
+- This is not yet a model-ready dataset. No database streaming/run grouping, ambiguity census, dataset ID/manifest, split, or persisted smoke rows exist. Gate 2 is not ready for review.
 
 ## Current model / experiment state
 
@@ -86,9 +87,9 @@
 
 ## Exact next action
 
-1. Commit the reviewed M0/M1 product and recovery checkpoint without including generated logs or artifacts.
+1. Add a bounded, read-only, streaming database extractor around `transitpulse_ml.segments`, including service-day identity, ambiguity/terminal rejection, quality counters, and a persisted small smoke dataset.
 2. Keep M1's bounded, network-enabled recorder running; check observation coverage again at the next ML milestone.
-3. Add a bounded, read-only, streaming database extractor around `transitpulse_ml.segments`, including service-day identity, ambiguity/terminal rejection, quality counters, and a persisted small smoke dataset. Do not train or split models before Gate 2 ML and Transit Luna PASS.
+3. Do not train or split models before Gate 2 ML and Transit Luna PASS.
 
 ## Commands to continue
 
