@@ -52,6 +52,9 @@ REQUIRED_COLUMNS = {
     "calendar_dates.txt": {"service_id", "date", "exception_type"},
 }
 
+_STOP_LOCATION_TYPES = {0, 1, 2, 3, 4}
+_STOP_FIELDS_REQUIRED_BY_LOCATION_TYPE = {0, 1, 2}
+
 
 class GtfsImportError(ValueError):
     """A source feed could not be validated or represented safely."""
@@ -97,10 +100,12 @@ def parse_gtfs_zip(archive: bytes) -> ParsedGtfsFeed:
                     raise GtfsImportError(
                         f"{table_name} is missing columns: {', '.join(sorted(missing_columns))}"
                     )
-                tables[table_name] = [
-                    {key: (value or "").strip() for key, value in row.items()}
-                    for row in reader
-                ]
+                rows: list[dict[str, str]] = []
+                for row in reader:
+                    if None in row:
+                        raise GtfsImportError(f"{table_name} has more values than its header row")
+                    rows.append({key: (value or "").strip() for key, value in row.items()})
+                tables[table_name] = rows
     except zipfile.BadZipFile as error:
         raise GtfsImportError("Source is not a valid GTFS ZIP archive") from error
     except UnicodeDecodeError as error:
@@ -269,19 +274,26 @@ def _add_stops(session: Session, feed: GtfsFeed, rows: list[dict[str, str]]) -> 
         stop_id = _required(row, "stop_id")
         if stop_id in stops:
             raise GtfsImportError(f"Duplicate stop_id {stop_id!r}")
-        longitude = _parse_coordinate(row["stop_lon"], "stop_lon", -180, 180)
-        latitude = _parse_coordinate(row["stop_lat"], "stop_lat", -90, 90)
+        location_type = _parse_stop_location_type(row)
+        coordinates = _parse_stop_coordinates(row, location_type)
+        location = None
+        if coordinates is not None:
+            longitude, latitude = coordinates
+            location = WKTElement(f"POINT({longitude} {latitude})", srid=4326)
         stop = Stop(
             feed_id=feed.id,
             gtfs_stop_id=stop_id,
             code=_optional(row.get("stop_code")),
-            name=_required(row, "stop_name"),
+            # GTFS permits anonymous generic nodes and boarding areas.  The
+            # non-null database column preserves an intentionally blank source
+            # name as an empty string rather than inventing a display value.
+            name=_optional(row.get("stop_name")) or "",
             description=_optional(row.get("stop_desc")),
-            location_type=_parse_int(row.get("location_type"), "location_type", default=0),
+            location_type=location_type,
             parent_station_gtfs_id=_optional(row.get("parent_station")),
             timezone=_optional(row.get("stop_timezone")),
             wheelchair_boarding=_parse_optional_int(row.get("wheelchair_boarding"), "wheelchair_boarding"),
-            location=WKTElement(f"POINT({longitude} {latitude})", srid=4326),
+            location=location,
         )
         stops[stop_id] = stop
         session.add(stop)
@@ -465,6 +477,100 @@ def _validate_references(tables: dict[str, list[dict[str, str]]]) -> None:
     for name in REQUIRED_FILES:
         if not tables[name]:
             raise GtfsImportError(f"{name} contains no rows")
+    stop_location_types = _validate_stops(tables["stops.txt"])
+    _validate_stop_times_reference_platforms(tables["stop_times.txt"], stop_location_types)
+
+
+def _validate_stops(rows: list[dict[str, str]]) -> dict[str, int]:
+    """Validate fields whose GTFS requirements vary by ``location_type``."""
+
+    stop_location_types: dict[str, int] = {}
+    parent_stations: dict[str, str | None] = {}
+    for row in rows:
+        stop_id = _required(row, "stop_id")
+        if stop_id in stop_location_types:
+            raise GtfsImportError(f"Duplicate stop_id {stop_id!r}")
+
+        location_type = _parse_stop_location_type(row)
+        stop_location_types[stop_id] = location_type
+        name = _optional(row.get("stop_name"))
+        if location_type in _STOP_FIELDS_REQUIRED_BY_LOCATION_TYPE and name is None:
+            raise GtfsImportError(f"Stop {stop_id!r} is missing required value stop_name")
+        _parse_stop_coordinates(row, location_type)
+
+        parent_station = _optional(row.get("parent_station"))
+        if location_type == 1:
+            if parent_station is not None:
+                raise GtfsImportError(f"Station {stop_id!r} must not define parent_station")
+        elif location_type in {2, 3, 4} and parent_station is None:
+            raise GtfsImportError(
+                f"Stop {stop_id!r} with location_type {location_type} requires parent_station"
+            )
+        parent_stations[stop_id] = parent_station
+
+    for stop_id, parent_station in parent_stations.items():
+        if parent_station is None:
+            continue
+        parent_location_type = stop_location_types.get(parent_station)
+        if parent_location_type is None:
+            raise GtfsImportError(
+                f"Stop {stop_id!r} references unknown parent_station {parent_station!r}"
+            )
+        location_type = stop_location_types[stop_id]
+        required_parent_type = 0 if location_type == 4 else 1
+        if parent_location_type != required_parent_type:
+            expected = "platform (location_type 0)" if required_parent_type == 0 else "station (location_type 1)"
+            raise GtfsImportError(
+                f"Stop {stop_id!r} parent_station {parent_station!r} must reference a {expected}"
+            )
+    return stop_location_types
+
+
+def _validate_stop_times_reference_platforms(
+    rows: list[dict[str, str]], stop_location_types: dict[str, int]
+) -> None:
+    """GTFS trips may only service stops/platforms, never station internals."""
+
+    for row in rows:
+        stop_id = _required(row, "stop_id")
+        location_type = stop_location_types.get(stop_id)
+        if location_type is None:
+            raise GtfsImportError(f"stop_times references unknown stop_id {stop_id!r}")
+        if location_type != 0:
+            raise GtfsImportError(
+                f"stop_times stop_id {stop_id!r} must reference a stop/platform (location_type 0)"
+            )
+
+
+def _parse_stop_location_type(row: dict[str, str]) -> int:
+    location_type = _parse_int(row.get("location_type"), "location_type", default=0)
+    if location_type not in _STOP_LOCATION_TYPES:
+        raise GtfsImportError(f"location_type must be one of 0, 1, 2, 3, or 4: {location_type!r}")
+    return location_type
+
+
+def _parse_stop_coordinates(row: dict[str, str], location_type: int) -> tuple[float, float] | None:
+    """Parse a complete point when supplied, enforcing GTFS's conditional fields."""
+
+    latitude_value = _optional(row.get("stop_lat"))
+    longitude_value = _optional(row.get("stop_lon"))
+    if location_type in _STOP_FIELDS_REQUIRED_BY_LOCATION_TYPE:
+        latitude_value = _required(row, "stop_lat")
+        longitude_value = _required(row, "stop_lon")
+
+    latitude = (
+        _parse_coordinate(latitude_value, "stop_lat", -90, 90)
+        if latitude_value is not None
+        else None
+    )
+    longitude = (
+        _parse_coordinate(longitude_value, "stop_lon", -180, 180)
+        if longitude_value is not None
+        else None
+    )
+    if latitude is None or longitude is None:
+        return None
+    return longitude, latitude
 
 
 def _required(row: dict[str, str], key: str) -> str:

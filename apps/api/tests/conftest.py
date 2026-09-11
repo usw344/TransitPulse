@@ -19,7 +19,12 @@ _test_database_url = os.getenv("TRANSITPULSE_TEST_DATABASE_URL")
 # a multi-million-row GTFS import and recorded observations.  CI explicitly
 # opts in because its PostGIS service is disposable.
 if _test_database_url:
-    settings.database_url = str(validated_disposable_test_url(_test_database_url))
+    # ``str(URL)`` masks the password as ``***``.  Preserve the configured
+    # credential only in process memory so the isolated engine can connect;
+    # no URL is logged by this fixture.
+    settings.database_url = validated_disposable_test_url(_test_database_url).render_as_string(
+        hide_password=False
+    )
     get_engine.cache_clear()
 
 

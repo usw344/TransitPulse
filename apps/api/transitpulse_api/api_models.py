@@ -44,7 +44,7 @@ class StopProperties(BaseModel):
 
 class StopFeature(BaseModel):
     type: Literal["Feature"] = "Feature"
-    geometry: dict[str, Any]
+    geometry: dict[str, Any] | None
     properties: StopProperties
 
 
@@ -124,6 +124,7 @@ class RealtimeAlertResponse(BaseModel):
     url: str | None
     cause: str | None
     effect: str | None
+    active_periods: list[dict[str, str | None]]
     affected_routes: list[str]
     affected_stops: list[str]
     updated_at: datetime
@@ -142,6 +143,39 @@ class RouteOperationsResponse(BaseModel):
     headway_baseline_seconds: int | None
     bunching: bool
     service_gap: bool
+
+
+class NetworkRouteStatusResponse(BaseModel):
+    route_id: str
+    short_name: str | None
+    long_name: str | None
+    service_status: str
+    status_reason: str
+    active_vehicles: int
+    average_delay_seconds: int | None
+    delayed_vehicle_count: int
+    alert_count: int
+    prediction_stop_id: str | None
+    predicted_headways_seconds: list[int]
+    headway_baseline_seconds: int | None
+    bunching: bool
+    service_gap: bool
+    attention_score: int
+
+
+class NetworkHealthResponse(BaseModel):
+    static_feed_id: UUID
+    generated_at: datetime
+    stale: bool
+    active_vehicles: int
+    routes_with_live_service: int
+    routes_delayed: int
+    routes_with_bunching: int
+    routes_with_service_gaps: int
+    active_alerts: int
+    median_network_delay_seconds: int | None
+    routes: list[NetworkRouteStatusResponse]
+    issues: list[NetworkRouteStatusResponse]
 
 
 class HistoryVehicleObservationProperties(BaseModel):

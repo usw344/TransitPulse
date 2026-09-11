@@ -19,6 +19,7 @@ THRESHOLDS = OperationsThresholds(
 def test_delay_classification_thresholds_are_explicit() -> None:
     assert classify_delay(None, THRESHOLDS) == "NO_LIVE_DATA"
     assert classify_delay(60, THRESHOLDS) == "ON_TIME"
+    assert classify_delay(-61, THRESHOLDS) == "EARLY"
     assert classify_delay(61, THRESHOLDS) == "MINOR_DELAY"
     assert classify_delay(300, THRESHOLDS) == "MAJOR_DELAY"
 

@@ -32,8 +32,14 @@ class Settings(BaseSettings):
     realtime_request_timeout_seconds: float = 20.0
     operations_on_time_seconds: int = 60
     operations_major_delay_seconds: int = 300
+    operations_severe_delay_seconds: int = 600
     operations_bunching_ratio: float = 0.5
     operations_gap_ratio: float = 1.75
+    analytics_min_observations: int = 30
+    analytics_min_delay_samples: int = 10
+    analytics_min_coverage_seconds: int = 900
+    analytics_min_headway_samples: int = 2
+    analytics_comparison_min_coverage_ratio: float = 0.75
 
 
 settings = Settings()

@@ -14,7 +14,7 @@ from typing import Iterable, Literal
 
 
 ServiceState = Literal[
-    "ON_TIME", "MINOR_DELAY", "MAJOR_DELAY", "BUNCHING", "SERVICE_GAP", "NO_LIVE_DATA"
+    "ON_TIME", "EARLY", "MINOR_DELAY", "MAJOR_DELAY", "BUNCHING", "SERVICE_GAP", "NO_LIVE_DATA"
 ]
 
 
@@ -37,10 +37,11 @@ class HeadwayAnalysis:
 def classify_delay(delay_seconds: int | None, thresholds: OperationsThresholds) -> ServiceState:
     if delay_seconds is None:
         return "NO_LIVE_DATA"
-    magnitude = abs(delay_seconds)
-    if magnitude <= thresholds.on_time_seconds:
+    if abs(delay_seconds) <= thresholds.on_time_seconds:
         return "ON_TIME"
-    if magnitude < thresholds.major_delay_seconds:
+    if delay_seconds < -thresholds.on_time_seconds:
+        return "EARLY"
+    if delay_seconds < thresholds.major_delay_seconds:
         return "MINOR_DELAY"
     return "MAJOR_DELAY"
 
@@ -84,5 +85,6 @@ def classify_service(
     delays = list(delays_seconds)
     if not delays:
         return "ON_TIME"
-    worst = max(delays, key=lambda value: abs(value))
+    late_delays = [delay for delay in delays if delay > thresholds.on_time_seconds]
+    worst = max(late_delays) if late_delays else min(delays)
     return classify_delay(worst, thresholds)

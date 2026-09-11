@@ -117,8 +117,8 @@ class Stop(Base):
     parent_station_gtfs_id: Mapped[str | None] = mapped_column(String(255))
     timezone: Mapped[str | None] = mapped_column(String(64))
     wheelchair_boarding: Mapped[int | None] = mapped_column(SmallInteger)
-    location: Mapped[str] = mapped_column(
-        Geometry("POINT", srid=4326, spatial_index=False), nullable=False
+    location: Mapped[str | None] = mapped_column(
+        Geometry("POINT", srid=4326, spatial_index=False), nullable=True
     )
 
     stop_times: Mapped[list[StopTime]] = relationship(back_populates="stop")

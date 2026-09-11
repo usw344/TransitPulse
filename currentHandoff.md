@@ -2,7 +2,7 @@
 
 ## Current phase
 
-- Phase 2: route/trip/shape-aware segment dataset implementation is next. Documentation/recovery and data-audit/model-target phases are complete.
+- Phase 2: route/trip/shape-aware segment dataset implementation is next. Documentation/recovery and data-audit/model-target phases are complete; M0 product checkpoint and M1 runtime/recorder recovery are reached.
 - The program direction is a learned Edmonton transit digital twin followed by constrained operational optimization. Work must advance through the gates in `SUPERVISOR.md`; later phases may not be claimed before their prerequisites pass.
 
 ## Current product state
@@ -10,6 +10,8 @@
 - Existing product: Edmonton LIVE, REPLAY, and ANALYTICS implementation is present in a dirty working tree. Verified ML recovery/audit foundation is committed at `0e585a5`; tested segment-label primitives at `6bac0c6`; the finalized handoff at `2f36a66`; and the run archive through `c743b77`. Check `git status --short --branch` for the live ahead count.
 - Do not discard or overwrite the pre-existing uncommitted application/test changes. They are the user's work/current product continuation state.
 - MODEL LAB has not been implemented and must not be represented as real yet.
+- M0 — REACHED. Independent Luna Software/QA PASS: `git diff --check` clean; full API suite is 51 passed against explicit disposable `transitpulse_test` PostGIS after migration; frontend typecheck/build pass; analytics tests 3 passed; replay tests 5 passed; no secrets/generated artifacts found. The test fixture now keeps the approved disposable URL credential only in memory rather than converting it to masked `***`. Migration 0005 guards its downgrade against legitimate null stop locations and requires explicit remediation.
+- M1 — REACHED. At 2026-09-10 21:07 America/Regina, the supported launcher (run with network permission) verified PostgreSQL, PostGIS, migrations, and GTFS, then started API PID 15712 and recorder PID 21928 hidden. Windows denied command-line inspection, so process roles are evidenced by launcher order, API HTTP 200, and recorder log/status behavior. The prior failed recorder was PID 24916 (command line unavailable; it remained alive after API PID 17260 was stopped and kept reporting socket error 10013); it was terminated before launcher recovery. One short-lived attempted replacement, PID 34996, exited because the old process held `realtime.log` open. The existing `transitpulse_api.realtime_recorder` entry point now uses bounded rotation when given `--log-file`: 2,000,000 bytes plus 3 backups. Successful ETS polls at 21:07:57, 21:08:29, 21:09:00, and 21:09:32 reported 264 vehicle positions, 1,196/1,185/1,187/1,187 trip updates, and 90 alerts with no status errors. Immutable observations advanced 821,782 at 21:07:25 → 822,046 at 21:08:24 → 822,574 at 21:09:25. API `/health/db` and web each returned HTTP 200 after the second interval. `\.transitpulse-logs\realtime.log` is ignored and bounded by rotation.
 
 ## Current architecture
 
@@ -70,7 +72,8 @@
 
 - The working tree contains substantial pre-existing uncommitted LIVE/REPLAY/ANALYTICS changes; commits must avoid accidentally misattributing or losing them.
 - Observation history is sparse and discontinuous, with fewer than 30 usable days; deep learning is not currently justified.
-- Process command lines could not be inspected because Windows denied CIM access. PostgreSQL is reachable. Observation count/latest time advanced from 725,843 at 00:14:43 to 726,549 at 00:18:14, which is affirmative recorder-liveness evidence. Frontend `http://127.0.0.1:3000` returned HTTP 200; API `http://127.0.0.1:8000/health` refused the connection. No ML training or optimization job has been launched by this run.
+- PostgreSQL, API, frontend, and exactly one network-enabled recorder are currently live after supported launcher recovery. The initial sandboxed recorder source failures are resolved; raw observations are advancing. No ML training or optimization job has been launched by this run.
+- Migration 0005 cannot safely be downgraded while coordinate-less stops exist; it now fails with a remediation instruction rather than modifying/deleting valid source data. The safe product checkpoint has passed its independent review and is ready to commit.
 - Segment primitives do not yet prove loop/repeated-stop ambiguity handling, service-day identity for after-midnight trips, terminal/layover exclusion, or scalable database extraction. Do not treat them as a dataset pipeline.
 
 ## Failed approaches not to repeat
@@ -83,9 +86,9 @@
 
 ## Exact next action
 
-1. Add a bounded, read-only, streaming database extractor around `transitpulse_ml.segments`. Group observations by static feed, trip, vehicle, and correctly derived GTFS service day; use the actual ordered sparse stop sequences and route shape.
-2. Add loop/repeated-stop ambiguity detection, terminal/layover and midnight tests, per-rejection quality counters, and a real small-window smoke run. Do not relax rejections merely to increase row count.
-3. Persist the smoke rows under ignored `artifacts/datasets/<dataset-id>/` with a manifest containing source bounds/feed IDs/schema/label/filter thresholds/quality counts/row-segment-route counts/chronological period placeholders/checksum. Then request Gate 2 ML and Transit Luna reviews. Do not train or split models before Gate 2 PASS.
+1. Commit the reviewed M0/M1 product and recovery checkpoint without including generated logs or artifacts.
+2. Keep M1's bounded, network-enabled recorder running; check observation coverage again at the next ML milestone.
+3. Add a bounded, read-only, streaming database extractor around `transitpulse_ml.segments`, including service-day identity, ambiguity/terminal rejection, quality counters, and a persisted small smoke dataset. Do not train or split models before Gate 2 ML and Transit Luna PASS.
 
 ## Commands to continue
 
