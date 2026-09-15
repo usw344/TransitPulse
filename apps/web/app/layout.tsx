@@ -4,7 +4,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "TransitPulse",
-  description: "TransitPulse foundation status",
+  description: "Real-time transit analytics and experimental service planning for Edmonton.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: ReactNode }>) {

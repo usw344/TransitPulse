@@ -323,11 +323,63 @@ class RealtimeTripState(Base):
     )
 
 
+class RealtimeTripObservation(Base):
+    """Immutable active-vehicle trip-update fact for future M7 evaluation.
+
+    This is deliberately limited to a trip update that can be tied to a
+    vehicle published in the same recorder poll.  Recording every stop update for every
+    trip on every poll would be unnecessarily high-volume; this bounded-rate
+    history preserves the source-published timing and delay fact required to
+    assess a progressing active run without rewriting any prior observations.
+    """
+
+    __tablename__ = "realtime_trip_observations"
+    __table_args__ = (
+        UniqueConstraint("observation_key", name="uq_realtime_trip_observations_key"),
+        Index("ix_realtime_trip_observation_vehicle_time", "vehicle_id", "observed_at"),
+        Index("ix_realtime_trip_observation_route_time", "route_gtfs_id", "observed_at"),
+        Index("ix_realtime_trip_observation_feed_time", "static_feed_id", "observed_at"),
+        Index(
+            "ix_realtime_trip_observation_trip_stop_time",
+            "trip_gtfs_id",
+            "next_stop_sequence",
+            "observed_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    observation_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    static_feed_id: Mapped[UUID] = mapped_column(
+        ForeignKey("gtfs_feeds.id", ondelete="RESTRICT"), nullable=False
+    )
+    source_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    vehicle_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    trip_gtfs_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    route_gtfs_id: Mapped[str | None] = mapped_column(String(255))
+    schedule_relationship: Mapped[str | None] = mapped_column(String(64))
+    delay_seconds: Mapped[int | None] = mapped_column(Integer)
+    next_stop_id: Mapped[str | None] = mapped_column(String(255))
+    next_stop_sequence: Mapped[int | None] = mapped_column(Integer)
+    next_arrival_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_departure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_arrival_delay_seconds: Mapped[int | None] = mapped_column(Integer)
+    next_departure_delay_seconds: Mapped[int | None] = mapped_column(Integer)
+
+
 class RealtimeAlert(Base):
     """Latest active alert as published by the official feed."""
 
     __tablename__ = "realtime_alerts"
-    __table_args__ = (Index("ix_rt_alert_feed", "static_feed_id"),)
+    __table_args__ = (
+        # Created by migration 0003; declared here so the model matches the schema.
+        UniqueConstraint("static_feed_id", "entity_id", name="uq_rt_alert_feed_entity"),
+        Index("ix_rt_alert_feed", "static_feed_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     static_feed_id: Mapped[UUID] = mapped_column(

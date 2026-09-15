@@ -34,6 +34,9 @@ class HeadwayResponse(BaseModel):
     source: Literal["direct_recorded_stop_sequence_entries", "static_gtfs_schedule"]
     stop_id: str | None
     stop_name: str | None
+    #: GTFS direction_id these headways are restricted to; opposing directions
+    #: are never pooled, so this identifies which direction is being reported.
+    direction_id: int | None = None
     sample_count: int
     median_seconds: int | None
     baseline_seconds: int | None

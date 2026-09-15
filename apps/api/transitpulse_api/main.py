@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 from statistics import median
@@ -10,12 +11,15 @@ from typing import Annotated
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from transitpulse_api.api_models import (
+    ScenarioEstimateRequest,
     AgencyResponse,
     HistoryAvailabilityResponse,
     HistoryVehicleObservationCollection,
@@ -78,9 +82,40 @@ from transitpulse_api.models import (
     Trip,
     VehicleObservation,
 )
-from transitpulse_api.operations import OperationsThresholds, calculate_headways, classify_service
+from transitpulse_api.operations import (
+    ATTENTION_STATES,
+    OperationsThresholds,
+    arrivals_within_horizon,
+    calculate_headways,
+    classify_service,
+)
+from transitpulse_api.model_lab import model_lab_summary
+from transitpulse_api.scenarios import ScenarioUnavailable, load_scenario_service
 
-app = FastAPI(title="TransitPulse API", version="0.4.0")
+app = FastAPI(title="TransitPulse API", version="0.5.0")
+
+
+@app.exception_handler(RequestValidationError)
+def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Return a 422 that can actually be serialized.
+
+    FastAPI's default handler echoes the rejected value back as ``input``.  When
+    that value is ``NaN`` or ``Infinity`` — which a JSON body may legally carry
+    and Pydantic correctly rejects — Starlette's ``JSONResponse`` serializes with
+    ``allow_nan=False`` and raises, turning a clean 422 into a 500.  Scrubbing
+    non-finite inputs keeps the rejection a rejection.
+    """
+
+    def scrub(value: object) -> object:
+        if isinstance(value, float) and not math.isfinite(value):
+            return str(value)
+        if isinstance(value, dict):
+            return {key: scrub(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [scrub(item) for item in value]
+        return value
+
+    return JSONResponse(status_code=422, content={"detail": scrub(exc.errors())})
 SessionDependency = Annotated[Session, Depends(get_session)]
 MAX_RELIABILITY_OBSERVATIONS = 10_000
 
@@ -105,6 +140,84 @@ def database_health() -> dict[str, str]:
         raise HTTPException(status_code=503, detail="database unavailable") from error
 
     return {"status": "ok", "postgis_version": str(postgis_version)}
+
+
+@app.get("/api/model-lab/summary", tags=["model-lab"])
+def model_lab() -> dict[str, object]:
+    """Serve read-only, versioned experimental evidence for the Model Lab UI."""
+
+    return model_lab_summary()
+
+
+# ---------------------------------------------------------------------------
+# SCENARIOS — cross-city planning estimator
+# ---------------------------------------------------------------------------
+
+
+def _scenario_service():
+    """Resolve the estimator, or turn a missing artifact into a clean 503.
+
+    The estimator lives in ``artifacts/``, which is generated and git-ignored, so
+    a fresh checkout legitimately has no model.  That is an unavailable surface,
+    not a server fault, and the message says exactly which artifact to build.
+    """
+
+    try:
+        return load_scenario_service()
+    except ScenarioUnavailable as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.get("/api/scenarios/model", tags=["scenarios"])
+def scenario_model() -> dict[str, object]:
+    """Model provenance, held-out accuracy and stated limitations.
+
+    Served from the model artifact itself so the UI cannot claim accuracy the
+    artifact does not record.
+    """
+
+    return _scenario_service().model_card()
+
+
+@app.get("/api/scenarios/routes", tags=["scenarios"])
+def scenario_routes() -> dict[str, object]:
+    """Route directions and day types a scenario can be built from."""
+
+    service = _scenario_service()
+    return {
+        "city": "Edmonton",
+        "dataset": service.dataset,
+        "dataset_checksum_matches": service.dataset_checksum_matches,
+        "routes": service.route_list(),
+    }
+
+
+@app.get("/api/scenarios/routes/{key:path}", tags=["scenarios"])
+def scenario_route(key: str) -> dict[str, object]:
+    """One route direction's currently scheduled plan."""
+
+    service = _scenario_service()
+    try:
+        return {"baseline": service.baseline(key).summary()}
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=f"unknown scenario route {key!r}") from error
+
+
+@app.post("/api/scenarios/estimate", tags=["scenarios"])
+def scenario_estimate(payload: ScenarioEstimateRequest) -> dict[str, object]:
+    """Estimate a proposed plan against a route's current schedule."""
+
+    service = _scenario_service()
+    try:
+        return service.estimate(payload.key, payload.changes())
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=f"unknown scenario route {payload.key!r}") from error
+    except ScenarioUnavailable as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except ValueError as error:
+        # RoutePlan rejects physically impossible plans (zero length, one stop,
+        # a 30-hour span). That is the caller's input problem, not a 500.
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 def selected_feed(
@@ -287,7 +400,20 @@ def operations_thresholds() -> OperationsThresholds:
         major_delay_seconds=settings.operations_major_delay_seconds,
         bunching_ratio=settings.operations_bunching_ratio,
         gap_ratio=settings.operations_gap_ratio,
+        prediction_horizon_seconds=settings.operations_prediction_horizon_seconds,
     )
+
+
+def prediction_reference(session: Session) -> datetime:
+    """Anchor the comparable-prediction horizon to published feed time.
+
+    Using the trip-update feed's own source timestamp keeps the horizon aligned
+    with the evidence being measured instead of local clock drift.
+    """
+
+    trip_feed = session.get(RealtimeFeedStatus, "trip_updates")
+    published = trip_feed.source_timestamp if trip_feed else None
+    return published or datetime.now(tz=timezone.utc)
 
 
 @app.get("/api/operations/routes/{route_id}", response_model=RouteOperationsResponse, tags=["operations"])
@@ -316,57 +442,76 @@ def route_operations(
     for item in trips:
         if item.next_stop_id is not None and item.next_arrival_at is not None:
             arrivals_by_stop[item.next_stop_id].append(item.next_arrival_at)
+    thresholds = operations_thresholds()
     prediction_stop_id, arrivals = max(
         arrivals_by_stop.items(), key=lambda entry: len(entry[1]), default=(None, [])
     )
-    headway = calculate_headways(arrivals, operations_thresholds())
+    comparable_arrivals, excluded_arrivals = arrivals_within_horizon(
+        arrivals,
+        reference=prediction_reference(session),
+        horizon_seconds=thresholds.prediction_horizon_seconds,
+    )
+    headway = calculate_headways(
+        comparable_arrivals,
+        thresholds,
+        excluded_beyond_horizon=excluded_arrivals,
+    )
     vehicle_feed = session.get(RealtimeFeedStatus, "vehicle_positions")
-    has_fresh_live_data = vehicle_feed is not None and not realtime_is_stale(
-        vehicle_feed.last_success_at, vehicle_feed.source_timestamp
+    # A fresh feed says the network is reporting; it does not say this route is.
+    # Trip updates alone are published predictions, not an observed vehicle, so
+    # this matches the network summary in requiring an actual vehicle position.
+    # Without that the route list badge and this panel disagree, and the panel
+    # asserts a delay for a route with no vehicle running.
+    has_fresh_live_data = (
+        vehicle_feed is not None
+        and not realtime_is_stale(vehicle_feed.last_success_at, vehicle_feed.source_timestamp)
+        and bool(vehicles)
     )
     service_status = classify_service(
         has_fresh_live_data=has_fresh_live_data,
         delays_seconds=delays,
         headway=headway,
-        thresholds=operations_thresholds(),
+        thresholds=thresholds,
     )
     alerts = session.scalars(
         select(RealtimeAlert).where(RealtimeAlert.static_feed_id == feed.id)
     ).all()
     alert_count = sum(route_id in alert.affected_routes for alert in alerts)
-    reasons = {
-        "NO_LIVE_DATA": "Vehicle Positions has not produced a fresh snapshot.",
-        "BUNCHING": "Comparable predicted arrivals are unusually close at one stop.",
-        "SERVICE_GAP": "Comparable predicted arrivals show an unusually large gap at one stop.",
-        "MAJOR_DELAY": "At least one current trip update exceeds the configured major-delay threshold.",
-        "MINOR_DELAY": "Current trip updates exceed the on-time tolerance.",
-        "ON_TIME": "Fresh live data has no current delay or comparable spacing exception.",
-    }
     return RouteOperationsResponse(
         route_id=route_id,
         active_vehicles=len(vehicles),
         service_status=service_status,
-        status_reason=reasons[service_status],
+        status_reason=_route_status_reason(service_status),
         average_delay_seconds=round(sum(delays) / len(delays)) if delays else None,
-        delayed_vehicle_count=sum(abs(delay) > settings.operations_on_time_seconds for delay in delays),
+        delayed_vehicle_count=sum(delay > settings.operations_on_time_seconds for delay in delays),
         alert_count=alert_count,
         prediction_stop_id=prediction_stop_id,
         predicted_headways_seconds=list(headway.headways_seconds),
         headway_baseline_seconds=round(headway.baseline_seconds) if headway.baseline_seconds else None,
         bunching=headway.bunching,
         service_gap=headway.service_gap,
+        excluded_arrivals_beyond_horizon=headway.excluded_beyond_horizon,
+        prediction_horizon_seconds=headway.horizon_seconds,
     )
 
 
 def _route_status_reason(service_status: str) -> str:
+    """One wording for every surface, so the route panel and network list agree.
+
+    Two separate dictionaries once drifted apart, and the one missing EARLY made
+    the route panel return HTTP 500 for early-running routes.
+    """
+
+    on_time = settings.operations_on_time_seconds
+    major = settings.operations_major_delay_seconds
     return {
-        "NO_LIVE_DATA": "No fresh vehicle snapshot is available for this route.",
+        "NO_LIVE_DATA": "No fresh vehicle position or delay evidence is available for this route.",
         "BUNCHING": "Predicted arrivals at one stop are unusually close together.",
         "SERVICE_GAP": "Predicted arrivals at one stop show an unusually large gap.",
-        "EARLY": "Current trips are running ahead of the configured on-time tolerance.",
-        "MAJOR_DELAY": "A current trip exceeds the configured major-delay threshold.",
-        "MINOR_DELAY": "Current trips exceed the configured on-time tolerance.",
-        "ON_TIME": "Fresh live data shows no current delay or spacing exception.",
+        "EARLY": f"Current trips are running more than {on_time} s ahead of schedule on average.",
+        "MAJOR_DELAY": f"Current trips are running more than {major // 60} min late on average.",
+        "MINOR_DELAY": f"Current trips are running between {on_time} s and {major // 60} min late on average.",
+        "ON_TIME": f"Current trips are within {on_time} s of schedule on average, with no spacing exception.",
     }[service_status]
 
 
@@ -432,6 +577,7 @@ def network_operations(feed: FeedDependency, session: SessionDependency) -> Netw
         vehicle_feed.source_timestamp if vehicle_feed else None,
     )
     thresholds = operations_thresholds()
+    prediction_horizon_reference = prediction_reference(session)
     route_statuses: list[NetworkRouteStatusResponse] = []
     all_delays: list[int] = []
     for route_id in sorted(route_ids):
@@ -448,7 +594,16 @@ def network_operations(feed: FeedDependency, session: SessionDependency) -> Netw
         prediction_stop_id, arrivals = max(
             arrivals_by_stop.items(), key=lambda entry: len(entry[1]), default=(None, [])
         )
-        headway = calculate_headways(arrivals, thresholds)
+        comparable_arrivals, excluded_arrivals = arrivals_within_horizon(
+            arrivals,
+            reference=prediction_horizon_reference,
+            horizon_seconds=thresholds.prediction_horizon_seconds,
+        )
+        headway = calculate_headways(
+            comparable_arrivals,
+            thresholds,
+            excluded_beyond_horizon=excluded_arrivals,
+        )
         service_status = classify_service(
             has_fresh_live_data=not stale and bool(route_vehicles),
             delays_seconds=delays,
@@ -475,6 +630,8 @@ def network_operations(feed: FeedDependency, session: SessionDependency) -> Netw
                 headway_baseline_seconds=round(headway.baseline_seconds) if headway.baseline_seconds else None,
                 bunching=headway.bunching,
                 service_gap=headway.service_gap,
+                excluded_arrivals_beyond_horizon=headway.excluded_beyond_horizon,
+                prediction_horizon_seconds=headway.horizon_seconds,
                 attention_score=_attention_score(
                     service_status,
                     delayed_vehicle_count=delayed_vehicle_count,
@@ -483,8 +640,15 @@ def network_operations(feed: FeedDependency, session: SessionDependency) -> Netw
                 ),
             )
         )
+    # A realtime route id absent from the static feed cannot be opened, shaped
+    # or checked against a schedule, so it is counted above but never queued as
+    # an issue for someone to inspect.
     issues = sorted(
-        (status for status in route_statuses if status.attention_score > 0),
+        (
+            status
+            for status in route_statuses
+            if status.service_status in ATTENTION_STATES and status.route_id in routes_by_gtfs_id
+        ),
         key=lambda status: (-status.attention_score, status.short_name or status.route_id),
     )
     ordered_routes = sorted(
@@ -743,16 +907,24 @@ def scheduled_stop_times(
     start: datetime,
     end: datetime,
     agency_timezone: str,
+    direction_id: int | None = None,
 ) -> list[datetime]:
-    """Return static scheduled arrivals at one physical stop inside this range."""
+    """Return static scheduled arrivals at one physical stop inside this range.
 
+    ``direction_id`` restricts the result to a single direction of travel so a
+    scheduled headway stays comparable with a directional observed headway.
+    """
+
+    conditions = [Trip.route_id == route.id, StopTime.stop_id == stop.id]
+    if direction_id is not None:
+        conditions.append(Trip.direction_id == direction_id)
     rows = session.execute(
         select(
             Trip.service_id,
             func.coalesce(StopTime.arrival_seconds, StopTime.departure_seconds),
         )
         .join(Trip, StopTime.trip_id == Trip.id)
-        .where(Trip.route_id == route.id, StopTime.stop_id == stop.id)
+        .where(*conditions)
     ).all()
     rows = [(service_id, seconds) for service_id, seconds in rows if seconds is not None]
     if not rows:
@@ -858,6 +1030,7 @@ def route_reliability(
                 Stop,
                 func.ST_X(Stop.location).label("longitude"),
                 func.ST_Y(Stop.location).label("latitude"),
+                Trip.direction_id,
             )
             .join(StopTime, StopTime.trip_id == Trip.id)
             .join(Stop, Stop.id == StopTime.stop_id)
@@ -868,29 +1041,35 @@ def route_reliability(
             )
         ).all()
         stop_for_sequence = {
-            (trip_id, stop_sequence): (stop, longitude, latitude)
-            for trip_id, stop_sequence, stop, longitude, latitude in matching_stops
+            (trip_id, stop_sequence): (stop, longitude, latitude, direction_id)
+            for trip_id, stop_sequence, stop, longitude, latitude, direction_id in matching_stops
         }
 
-    events_by_stop: dict[int, list] = defaultdict(list)
-    stop_records: dict[int, tuple[Stop, float | None, float | None]] = {}
+    # A physical stop on a two-way route is served in both directions, and one
+    # route can stop there under several trip variants.  Pooling those arrivals
+    # produces an apparent headway that is a multiple of the real directional
+    # service, so headways are always grouped per (stop, direction).
+    events_by_stop: dict[tuple[int, int | None], list] = defaultdict(list)
+    stop_records: dict[tuple[int, int | None], tuple[Stop, float | None, float | None, int | None]] = {}
     for event in events:
         if event.trip_id is None:
             continue
         matched_stop = stop_for_sequence.get((event.trip_id, event.stop_sequence))
         if matched_stop is None:
             continue
-        stop, longitude, latitude = matched_stop
-        stop_records[stop.id] = matched_stop
-        events_by_stop[stop.id].append(event)
+        stop, longitude, latitude, direction_id = matched_stop
+        key = (stop.id, direction_id)
+        stop_records[key] = matched_stop
+        events_by_stop[key].append(event)
 
-    selected_stop_id = max(
+    selected_key = max(
         events_by_stop,
-        key=lambda stop_id: (len(events_by_stop[stop_id]), -stop_id),
+        key=lambda key: (len(events_by_stop[key]), -key[0]),
         default=None,
     )
-    selected_stop = stop_records.get(selected_stop_id) if selected_stop_id is not None else None
-    selected_events = events_by_stop.get(selected_stop_id, []) if selected_stop_id is not None else []
+    selected_stop = stop_records.get(selected_key) if selected_key is not None else None
+    selected_events = events_by_stop.get(selected_key, []) if selected_key is not None else []
+    selected_direction_id = selected_key[1] if selected_key is not None else None
     scheduled_arrivals = (
         scheduled_stop_times(
             session,
@@ -899,6 +1078,7 @@ def route_reliability(
             start=window_start,
             end=window_end,
             agency_timezone=agency.timezone,
+            direction_id=selected_direction_id,
         )
         if selected_stop is not None
         else []
@@ -955,11 +1135,22 @@ def route_reliability(
     comparable_periods = [bucket for bucket in timeline if bucket.median_delay_seconds is not None]
     best_period = min(comparable_periods, key=lambda bucket: abs(bucket.median_delay_seconds or 0), default=None)
     worst_period = max(comparable_periods, key=lambda bucket: abs(bucket.median_delay_seconds or 0), default=None)
+    # The spatial layer is per physical stop: emitting one marker per direction
+    # would stack duplicate points on identical coordinates.  Delay at a stop is
+    # meaningful across both directions, unlike a headway.
+    events_by_physical_stop: dict[int, list] = defaultdict(list)
+    physical_stop_records: dict[int, tuple[Stop, float | None, float | None]] = {}
+    for (stop_id, _direction_id), stop_events in events_by_stop.items():
+        stop, longitude, latitude, _ = stop_records[(stop_id, _direction_id)]
+        physical_stop_records[stop_id] = (stop, longitude, latitude)
+        events_by_physical_stop[stop_id].extend(stop_events)
+
     spatial_features: list[ReliabilityStopFeature] = []
     for stop_id, stop_events in sorted(
-        events_by_stop.items(), key=lambda item: stop_records[item[0]][0].gtfs_stop_id
+        events_by_physical_stop.items(),
+        key=lambda item: physical_stop_records[item[0]][0].gtfs_stop_id,
     ):
-        stop, longitude, latitude = stop_records[stop_id]
+        stop, longitude, latitude = physical_stop_records[stop_id]
         if longitude is None or latitude is None:
             continue
         stop_delay = delay_distribution(event.delay_seconds for event in stop_events)
@@ -1016,6 +1207,7 @@ def route_reliability(
             source="direct_recorded_stop_sequence_entries",
             stop_id=selected_stop[0].gtfs_stop_id if selected_stop else None,
             stop_name=selected_stop[0].name if selected_stop else None,
+            direction_id=selected_direction_id,
             **observed.__dict__,
             sufficient=observed.sample_count >= settings.analytics_min_headway_samples,
         ),
@@ -1023,6 +1215,7 @@ def route_reliability(
             source="static_gtfs_schedule",
             stop_id=selected_stop[0].gtfs_stop_id if selected_stop else None,
             stop_name=selected_stop[0].name if selected_stop else None,
+            direction_id=selected_direction_id,
             **scheduled.__dict__,
             sufficient=scheduled.sample_count >= settings.analytics_min_headway_samples,
         ),

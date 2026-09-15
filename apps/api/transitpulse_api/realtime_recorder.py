@@ -48,7 +48,11 @@ def record_once() -> None:
     if result.failures:
         logger.warning("Realtime poll completed with source failures: %s", ", ".join(result.failures))
     else:
-        logger.info("Recorded current realtime state: %s", result.feed_counts)
+        logger.info(
+            "Recorded current realtime state: feeds=%s observations=%s",
+            result.feed_counts,
+            result.recorded_counts,
+        )
 
 
 def main() -> None:

@@ -66,3 +66,42 @@ export function replayFrameAt<T extends ReplayObservation>(
 export function vehicleDataForMode<T>(mode: ReplayMode, live: T, replay: T): T {
   return mode === "replay" ? replay : live;
 }
+
+export interface ReplayCoverageBucket {
+  start: string;
+  count: number;
+}
+
+export const REPLAY_COVERAGE_BUCKETS = 24;
+
+/**
+ * Bucket recorded observations across the loaded replay window.
+ *
+ * This measures *recording* density, not service: an empty bucket means no
+ * observation was recorded in that interval, which is not evidence that no
+ * service ran. Buckets are returned even when empty so a recording gap stays
+ * visible instead of being silently collapsed.
+ */
+export function replayCoverageBuckets(
+  features: ReplayObservation[],
+  start: string | null,
+  end: string | null,
+  bucketCount: number = REPLAY_COVERAGE_BUCKETS,
+): ReplayCoverageBucket[] {
+  if (!features.length || !start || !end || bucketCount <= 0) return [];
+  const from = Date.parse(start);
+  const to = Date.parse(end);
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return [];
+  const width = (to - from) / bucketCount;
+  const counts = new Array<number>(bucketCount).fill(0);
+  for (const feature of features) {
+    const at = observationTime(feature);
+    if (at === null || at < from || at > to) continue;
+    const index = Math.min(bucketCount - 1, Math.max(0, Math.floor((at - from) / width)));
+    counts[index] += 1;
+  }
+  return counts.map((count, index) => ({
+    start: new Date(from + index * width).toISOString(),
+    count,
+  }));
+}

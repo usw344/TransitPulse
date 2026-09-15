@@ -8,7 +8,10 @@
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "test:analytics": "tsc --ignoreConfig --outDir .next/analytics-test --module commonjs --target es2020 --types node --esModuleInterop app/analytics.ts tests/analytics.test.ts && node --test .next/analytics-test/tests/analytics.test.js",
-    "test:replay": "tsc --ignoreConfig --outDir .next/replay-test --module commonjs --target es2020 --types node --esModuleInterop app/replay.ts tests/replay.test.ts && node --test .next/replay-test/tests/replay.test.js"
+    "test:replay": "tsc --ignoreConfig --outDir .next/replay-test --module commonjs --target es2020 --types node --esModuleInterop app/replay.ts tests/replay.test.ts && node --test .next/replay-test/tests/replay.test.js",
+    "copy:maplibre-worker": "node scripts/copy-maplibre-worker.mjs",
+    "predev": "npm run copy:maplibre-worker",
+    "prebuild": "npm run copy:maplibre-worker"
   },
   "dependencies": {
     "maplibre-gl": "^6.7.0",

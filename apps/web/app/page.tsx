@@ -6,23 +6,60 @@ import {
   AttributionControl,
   LngLatBounds,
   Map,
-  NavigationControl,
   Popup,
   type GeoJSONSource,
+  setWorkerUrl,
 } from "maplibre-gl";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Feature, FeatureCollection, LineString, Point } from "geojson";
 
 import { canDisplayReliabilityEstimates } from "./analytics";
+import { API_NOT_RESPONDING, fetchJson } from "./format";
+import { wholeVehicles } from "./scenarios/ScenarioPanels";
+import { MapControls, type MapLayerToggles } from "./MapControls";
+import { transitPulseBasemapStyle } from "./mapStyle";
 import {
+  ROUTE_COLORS,
+  VEHICLE_COLORS,
+  networkLineOpacity,
+  networkLineWidth,
+  selectedRouteCasingWidth,
+  selectedRouteWidth,
+  stopCasingRadius,
+  stopRadius,
+  vehicleColorExpression,
+  vehicleIcon,
+  vehicleIconSize,
+} from "./mapSymbols";
+import { ScenarioControls } from "./scenarios/ScenarioControls";
+import { CurrentPlanPanel, EstimatePanel, ModelCardPanel } from "./scenarios/ScenarioPanels";
+import { useScenarios } from "./scenarios/useScenarios";
+import {
+  type ReplayObservation,
   advanceReplayTimestamp,
   clampReplayTimestamp,
+  replayCoverageBuckets,
   replayFrameAt,
   replayTimestampAtFraction,
   vehicleDataForMode,
 } from "./replay";
 
-type AppMode = "live" | "replay" | "analytics";
+type AppMode = "live" | "replay" | "analytics" | "scenarios";
+
+/**
+ * Minimum adjacent-headway intervals before derived bunching/gap/variability
+ * counts are shown.  Below this there is insufficient evidence for a reliable
+ * finding.
+ */
+const MIN_HEADWAY_EVENT_SAMPLES = 8;
+
+/** The primary product modes, each stated as the question it answers. */
+const MODES: ReadonlyArray<{ id: AppMode; label: string; question: string }> = [
+  { id: "live", label: "Live", question: "What is happening now?" },
+  { id: "replay", label: "Replay", question: "What happened earlier?" },
+  { id: "analytics", label: "Analytics", question: "How reliable was service?" },
+  { id: "scenarios", label: "Scenarios", question: "What if we changed the design?" },
+];
 
 type ServiceStatus = "loading" | "online" | "offline";
 type NetworkState = "loading" | "ready" | "empty" | "error";
@@ -129,6 +166,8 @@ interface RouteOperations {
   headway_baseline_seconds: number | null;
   bunching: boolean;
   service_gap: boolean;
+  excluded_arrivals_beyond_horizon: number;
+  prediction_horizon_seconds: number | null;
 }
 
 interface RealtimeAlert {
@@ -172,6 +211,14 @@ interface NetworkHealth {
   median_network_delay_seconds: number | null;
   routes: NetworkRouteStatus[];
   issues: NetworkRouteStatus[];
+}
+
+interface ErrorMetrics {
+  n: number;
+  mae: number;
+  median_ae: number;
+  p90_ae: number;
+  rmse: number;
 }
 
 interface ReliabilityStopProperties {
@@ -222,6 +269,7 @@ interface RouteReliability {
     late_over_10_count: number;
   };
   observed_headways: {
+    direction_id: number | null;
     source: "direct_recorded_stop_sequence_entries";
     stop_id: string | null;
     stop_name: string | null;
@@ -307,7 +355,8 @@ const EMPTY_COLLECTION: FeatureCollection = {
 };
 
 const EDMONTON_CENTER: [number, number] = [-113.4938, 53.5461];
-const MAP_STYLE = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json";
+/** Served from `public/`; see `scripts/copy-maplibre-worker.mjs`. */
+const MAPLIBRE_WORKER_URL = "/maplibre/maplibre-gl-worker.mjs";
 
 const FALLBACK_BOUNDS = { west: -113.95, east: -113.14, south: 53.32, north: 53.75 };
 
@@ -356,19 +405,12 @@ function TransitMapFallback({
       role="img"
       viewBox="0 0 1000 1000"
     >
-      <rect fill="#dbe7e8" fillOpacity="0.2" height="1000" width="1000" />
-      <g className="fallback-grid" aria-hidden="true">
-        {[150, 300, 450, 600, 750, 900].map((position) => (
-          <path d={`M0 ${position} H1000 M${position} 0 V1000`} key={position} />
-        ))}
-      </g>
-      <path
-        aria-hidden="true"
-        className="fallback-river"
-        d="M-40 610 C110 555 165 655 270 600 S430 555 540 600 S705 670 815 585 S950 525 1040 570"
-      />
-      <text className="fallback-city-label" x="500" y="420">EDMONTON</text>
-      <text className="fallback-city-subtitle" x="500" y="446">ALBERTA · LIVE TRANSIT NETWORK</text>
+      {/*
+        No decorative basemap geography here.  A stylised graticule and river
+        curve are not Edmonton, and drawing invented ground under real route
+        geometry misrepresents where service runs.  Only measured data is drawn.
+      */}
+      <rect fill="#e8edf2" height="1000" width="1000" />
       <g
         className="fallback-network"
         aria-label={`${networkShapes?.features.length ?? 0} static route shapes`}
@@ -414,6 +456,26 @@ function TransitMapFallback({
   );
 }
 
+/** Feed-supplied text (stop names, vehicle labels) is inserted into popup HTML. */
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (character) => `&#${character.charCodeAt(0)};`);
+}
+
+/**
+ * Padding for framing geometry on the map.
+ *
+ * Whether the analysis band sits over the canvas depends on the mode (LIVE and
+ * REPLAY shorten the canvas to stop above it; SCENARIOS draws underneath it),
+ * so the overlap is measured rather than assumed.  Asking MapLibre for more
+ * padding than the canvas has makes `fitBounds` silently do nothing.
+ */
+function mapFitPadding(container: HTMLElement | null) {
+  const band = container?.parentElement?.querySelector<HTMLElement>(".network-intelligence, .analytics-workspace");
+  const canvasBottom = container?.getBoundingClientRect().bottom ?? 0;
+  const overlap = band ? Math.max(0, canvasBottom - band.getBoundingClientRect().top) : 0;
+  return { top: 72, left: 56, right: 56, bottom: overlap + 56 };
+}
+
 function asFeatureCollection(data: GeoJsonFeatureCollection | null): FeatureCollection {
   return data ? { type: "FeatureCollection", features: data.features } : EMPTY_COLLECTION;
 }
@@ -427,15 +489,6 @@ function routeKind(routeType: number): "bus" | "rail" | "other" {
   return routeType === 0 || routeType === 1 || routeType === 2 ? "rail" : routeType === 3 ? "bus" : "other";
 }
 
-function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
-  return fetch(url, { cache: "no-store", signal }).then(async (response) => {
-    if (!response.ok) {
-      const detail = await response.json().catch(() => null) as { detail?: string } | null;
-      throw new Error(detail?.detail ?? `Request failed (${response.status})`);
-    }
-    return response.json() as Promise<T>;
-  });
-}
 
 function feedStatus(status: RealtimeStatus | null, kind: string) {
   return status?.feeds.find((feed) => feed.feed_kind === kind) ?? null;
@@ -455,6 +508,11 @@ function formatDelay(value: number | null): string {
 function formatSeconds(value: number | null): string {
   if (value === null) return "—";
   return `${Math.round(value / 60)} min`;
+}
+
+function formatPreciseSeconds(value: number | null | undefined): string {
+  if (value === null || value === undefined) return "—";
+  return `${value.toFixed(1)} s`;
 }
 
 function formatSignedSeconds(value: number | null): string {
@@ -481,11 +539,18 @@ function formatCoverage(seconds: number | null | undefined): string {
   return `${(seconds / 3600).toFixed(seconds % 3600 === 0 ? 0 : 1)} hr`;
 }
 
+function formatAlertTime(value: string): string {
+  return new Intl.DateTimeFormat("en-CA", { dateStyle: "medium", timeStyle: "short", timeZone: "America/Edmonton" }).format(new Date(value));
+}
+
 function formatAlertPeriod(alert: RealtimeAlert): string {
   const period = alert.active_periods[0];
-  if (!period?.start && !period?.end) return "Active period not supplied";
-  if (period.start && period.end) return `${formatReplayTime(period.start)} – ${formatReplayTime(period.end)}`;
-  return period.start ? `Active from ${formatReplayTime(period.start)}` : `Active until ${formatReplayTime(period.end)}`;
+  // Publishers encode "no end date" as a far-future sentinel (ETS uses the year
+  // 3000); printing it verbatim looks like a rendering bug.
+  const end = period?.end && new Date(period.end).getUTCFullYear() < 2100 ? period.end : null;
+  if (!period?.start && !end) return "Active period not supplied";
+  if (period.start && end) return `${formatAlertTime(period.start)} – ${formatAlertTime(end)}`;
+  return period.start ? `From ${formatAlertTime(period.start)} · until further notice` : `Until ${formatAlertTime(end as string)}`;
 }
 
 function formatCountDelta(value: number | null): string {
@@ -500,15 +565,80 @@ function toDateTimeLocalValue(value: string): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+/**
+ * Axis ticks in seconds for the delay chart, so magnitudes are readable off the
+ * plot instead of only on hover.
+ */
+function delayAxisCeiling(buckets: Array<{ median_delay_seconds: number | null; delay_observation_count: number }>): number {
+  const peak = buckets.reduce(
+    (largest, bucket) => (bucket.delay_observation_count > 0 ? Math.max(largest, Math.abs(bucket.median_delay_seconds ?? 0)) : largest),
+    0,
+  );
+  return Math.max(120, Math.ceil(peak / 60) * 60);
+}
+
+function delayAxisTicks(buckets: Array<{ median_delay_seconds: number | null; delay_observation_count: number }>): number[] {
+  const ceiling = delayAxisCeiling(buckets);
+  // Only emit ticks whose rendered label is distinct, so the axis never prints
+  // "0m, 1m, 1m, 2m" for a shallow range.
+  const candidates = [0, ceiling / 2, ceiling];
+  const seen = new Set<string>();
+  return candidates.filter((tick) => {
+    const label = formatAxisMinutes(tick);
+    if (seen.has(label)) return false;
+    seen.add(label);
+    return true;
+  });
+}
+
+/** Axis label for a delay tick, with sub-minute precision when the range is small. */
+function formatAxisMinutes(seconds: number): string {
+  if (seconds === 0) return "0";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const minutes = seconds / 60;
+  return Number.isInteger(minutes) ? `${minutes}m` : `${minutes.toFixed(1)}m`;
+}
+
+/** Height reserved under each large-chart bar for its value label. */
+const DELAY_LABEL_PX = 19;
+
 function reliabilityBarHeight(delaySeconds: number | null): number {
   if (delaySeconds === null) return 7;
   return Math.max(9, Math.min(100, Math.round((Math.abs(delaySeconds) / 600) * 100)));
 }
 
+/**
+ * Route states that count as "needing attention". Mirrors ATTENTION_STATES in
+ * apps/api/transitpulse_api/operations.py: routes averaging 1-5 minutes late are
+ * ordinary operations here, not exceptions.
+ */
+const ATTENTION_STATES = new Set(["SERVICE_GAP", "BUNCHING", "MAJOR_DELAY", "EARLY"]);
+
+/** Pluralize a count so the UI never reads "1 gaps". */
+function plural(count: number, singular: string, plural_ = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : plural_}`;
+}
+
+/**
+ * The single source of truth for how a service state is named on screen.
+ *
+ * The route-list badge and the selected-route status panel previously derived
+ * their own labels, so the same route could read DELAYED in one place and
+ * MINOR DELAY in another at the same moment.
+ */
+const SERVICE_STATE_LABELS: Record<string, string> = {
+  ON_TIME: "ON TIME",
+  EARLY: "EARLY",
+  MINOR_DELAY: "MINOR DELAY",
+  MAJOR_DELAY: "MAJOR DELAY",
+  BUNCHING: "BUNCHING",
+  SERVICE_GAP: "SERVICE GAP",
+  NO_LIVE_DATA: "NO DATA",
+};
+
 function statusLabel(value: string | undefined): string {
-  if (!value || value === "NO_LIVE_DATA") return "NO DATA";
-  if (value === "MINOR_DELAY" || value === "MAJOR_DELAY") return "DELAYED";
-  return value.replaceAll("_", " ");
+  if (!value) return SERVICE_STATE_LABELS.NO_LIVE_DATA;
+  return SERVICE_STATE_LABELS[value] ?? value.replaceAll("_", " ");
 }
 
 function statusClass(value: string | undefined): string {
@@ -519,6 +649,25 @@ function routeDisplayName(route: NetworkRouteStatus): string {
   return route.short_name ?? route.route_id;
 }
 
+/**
+ * The one-line evidence beside a priority-queue badge.  It follows the badge's
+ * own status, so a route flagged BUNCHING never shows a gap as its evidence
+ * just because it also happens to have one.
+ */
+function issueEvidence(issue: NetworkRouteStatus): string {
+  const headways = issue.predicted_headways_seconds;
+  if (issue.service_status === "SERVICE_GAP" && headways.length) {
+    return `Largest gap ${formatSeconds(Math.max(...headways))}`;
+  }
+  if (issue.service_status === "BUNCHING") {
+    const baseline = issue.headway_baseline_seconds;
+    const close = baseline ? headways.filter((value) => value < baseline * 0.5).length : 0;
+    return close ? plural(close, "close pair") : "Arrivals closer than scheduled";
+  }
+  const late = plural(issue.delayed_vehicle_count, "late trip");
+  return issue.average_delay_seconds === null ? late : `${late} · avg ${formatSignedSeconds(issue.average_delay_seconds)}`;
+}
+
 function routeHeadwayEvidence(operations: RouteOperations): string {
   const headways = operations.predicted_headways_seconds;
   if (!headways.length) return "No comparable predicted arrivals are available at one stop.";
@@ -527,12 +676,24 @@ function routeHeadwayEvidence(operations: RouteOperations): string {
   const baseline = operations.headway_baseline_seconds;
   if (operations.service_gap) return `Largest predicted gap at stop ${operations.prediction_stop_id ?? "—"}: ${formatSeconds(maximum)} versus ${formatSeconds(baseline)} baseline.`;
   if (operations.bunching) return `Closest predicted pair at stop ${operations.prediction_stop_id ?? "—"}: ${formatSeconds(minimum)} versus ${formatSeconds(baseline)} baseline.`;
-  return `${headways.length} predicted intervals at stop ${operations.prediction_stop_id ?? "—"}; range ${formatSeconds(minimum)}–${formatSeconds(maximum)}, baseline ${formatSeconds(baseline)}.`;
+  return `${headways.length} predicted intervals at stop ${operations.prediction_stop_id ?? "—"}; ${formatSeconds(minimum) === formatSeconds(maximum) ? `all ${formatSeconds(minimum)}` : `range ${formatSeconds(minimum)}–${formatSeconds(maximum)}`}, baseline ${formatSeconds(baseline)}.`;
+}
+
+/** Disclose that far-future predictions were filtered, rather than filtering silently. */
+function horizonExclusionNote(operations: RouteOperations): string | null {
+  if (!operations.excluded_arrivals_beyond_horizon) return null;
+  const horizon = operations.prediction_horizon_seconds;
+  const window = horizon ? `${Math.round(horizon / 60)} min` : "the comparable-service window";
+  const count = operations.excluded_arrivals_beyond_horizon;
+  return `${count} predicted arrival${count === 1 ? "" : "s"} beyond ${window} excluded as next-period service.`;
 }
 
 export default function Home() {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<Map | null>(null);
+  const popupRef = useRef<Popup | null>(null);
+  const attributionRef = useRef<AttributionControl | null>(null);
+  const basemapFailedRef = useRef(false);
   const [mapLoaded, setMapLoaded] = useState(false);
   const [apiStatus, setApiStatus] = useState<ServiceStatus>("loading");
   const [databaseStatus, setDatabaseStatus] = useState<ServiceStatus>("loading");
@@ -551,6 +712,19 @@ export default function Home() {
   const [vehicleState, setVehicleState] = useState<"loading" | "ready" | "error">("loading");
   const [vehicles, setVehicles] = useState<RealtimeVehicleCollection | null>(null);
   const [selectedVehicleId, setSelectedVehicleId] = useState<string | null>(null);
+  /**
+   * Whether MapLibre finished loading.  The SVG fallback must not draw over a
+   * working basemap: it washes out the tiles and duplicates the same network
+   * geometry the real layers already render.
+   */
+  const [mapReady, setMapReady] = useState(false);
+  /** Why the basemap is absent, when we actually know. */
+  const [basemapFailure, setBasemapFailure] = useState<string | null>(null);
+  const [mapLayers, setMapLayers] = useState<MapLayerToggles>({
+    routes: true,
+    stops: true,
+    vehicles: true,
+  });
   const [operations, setOperations] = useState<RouteOperations | null>(null);
   const [routeAlerts, setRouteAlerts] = useState<RealtimeAlert[]>([]);
   const [mode, setMode] = useState<AppMode>("live");
@@ -569,6 +743,13 @@ export default function Home() {
   const [analyticsEnd, setAnalyticsEnd] = useState<string | null>(null);
   const [analytics, setAnalytics] = useState<RouteReliability | null>(null);
   const [analyticsMessage, setAnalyticsMessage] = useState("Select a route to inspect recorded reliability.");
+  /**
+   * True while Period A is the automatically chosen default window.  A busy
+   * route records more observations in six hours than the API will analyse in
+   * one request, so only a default window is shrunk to fit; a range the user
+   * picked is never silently changed.
+   */
+  const analyticsAutoWindowRef = useRef(false);
   const [comparisonEnabled, setComparisonEnabled] = useState(false);
   const [comparisonStart, setComparisonStart] = useState<string | null>(null);
   const [comparisonEnd, setComparisonEnd] = useState<string | null>(null);
@@ -705,7 +886,7 @@ export default function Home() {
           const end = Date.parse(history.end);
           return new Date(clampReplayTimestamp(current ? Date.parse(current) : end, start, end)).toISOString();
         });
-        setReplayMessage(history.features.length ? `${history.features.length.toLocaleString()} bounded observations loaded for replay.` : "No positions were recorded in this window.");
+        setReplayMessage(history.features.length ? `${history.features.length.toLocaleString()} observations loaded for this window.` : "No positions were recorded in this window.");
       })
       .catch((error: unknown) => {
         if (!abortController.signal.aborted) {
@@ -761,35 +942,174 @@ export default function Home() {
       })),
     };
   }, [replayHistory, replayTimestamp]);
-  const displayedVehicles = mode === "analytics"
+  // Analytics and Scenarios both answer questions about the schedule, not about
+  // where buses are right now; plotting live vehicles on either would invite
+  // reading a live position as evidence for a historical or modelled claim.
+  const displayedVehicles = mode === "analytics" || mode === "scenarios"
     ? null
     : vehicleDataForMode(mode, vehicles, replayVehicles);
 
+  /** Recording density across the loaded replay window. */
+  const replayCoverage = useMemo(
+    () => replayCoverageBuckets(
+      (replayHistory?.features ?? []) as unknown as ReplayObservation[],
+      replayStart,
+      replayEnd,
+    ),
+    [replayHistory, replayStart, replayEnd],
+  );
+
+  const replayCoveragePeak = Math.max(1, ...replayCoverage.map((bucket) => bucket.count));
+
+  /**
+   * Mode emphasis and layer visibility.
+   *
+   * Each mode has a different subject, so the same four data layers are
+   * re-weighted rather than redrawn: LIVE leads with vehicles, ANALYTICS with
+   * reliability evidence, SCENARIOS with the route alignment alone. Keeping one
+   * set of layers means a mode switch never re-parses geometry, and the map
+   * cannot end up in a state where two modes' symbology are both visible.
+   */
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    const visible = (id: string, on: boolean) => {
+      if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", on ? "visible" : "none");
+    };
+    const paint = (id: string, property: "line-opacity", value: unknown) => {
+      if (map.getLayer(id)) map.setPaintProperty(id, property, value as never);
+    };
+
+    visible("network-routes-line", mapLayers.routes);
+    for (const id of ["selected-route-casing", "selected-route-line"]) {
+      visible(id, mapLayers.routes);
+    }
+    for (const id of ["selected-stops-casing", "selected-stops-dot"]) {
+      visible(id, mapLayers.stops && mode !== "analytics");
+    }
+    for (const id of ["reliability-stops-halo", "reliability-stops-dot"]) {
+      visible(id, mapLayers.stops && mode === "analytics");
+    }
+    const vehiclesOn = mapLayers.vehicles && (mode === "live" || mode === "replay");
+    for (const id of ["live-vehicles-halo", "live-vehicles-dot", "live-vehicles-heading"]) {
+      visible(id, vehiclesOn);
+    }
+
+    // In SCENARIOS the unselected network drops back hard, because the screen is
+    // about one route's geometry and everything else is orientation.
+    paint("network-routes-line", "line-opacity", networkLineOpacity(mode));
+  }, [mapReady, mapLayers, mode]);
+
+  const fitSelectedRoute = useCallback(() => {
+    const map = mapRef.current;
+    if (!map || !selectedShapes?.features.length) return;
+    map.resize();
+    const bounds = new LngLatBounds();
+    for (const feature of selectedShapes.features) {
+      const geometry = feature.geometry;
+      if (geometry.type !== "LineString") continue;
+      for (const coordinate of geometry.coordinates) {
+        bounds.extend(coordinate as [number, number]);
+      }
+    }
+    if (!bounds.isEmpty()) map.fitBounds(bounds, { padding: mapFitPadding(mapContainerRef.current), maxZoom: 15, duration: 550 });
+  }, [selectedShapes]);
+
+  const fitNetwork = useCallback(() => {
+    mapRef.current?.fitBounds(
+      [
+        [FALLBACK_BOUNDS.west, FALLBACK_BOUNDS.south],
+        [FALLBACK_BOUNDS.east, FALLBACK_BOUNDS.north],
+      ],
+      { padding: mapFitPadding(mapContainerRef.current), duration: 550 },
+    );
+  }, []);
+
+  // SCENARIOS. The catalogue is fetched lazily the first time the mode opens,
+  // because the estimator artifact is generated and a fresh checkout may not
+  // have one; a 503 should not be requested on every app start.
+  const scenarios = useScenarios("", mode === "scenarios");
+  const scenarioBaseline = scenarios.result?.baseline ?? null;
+  const scenarioUnchanged = scenarios.result?.estimate.scenario_unchanged ?? false;
+  // Frequency/span-only edits: the fleet moves, the speed model is not used.
+  const scenarioSpeedHeld = !scenarioUnchanged && (scenarios.result?.estimate.design_distance ?? 1) < 1e-9;
+
+  // Draw the scenario's route on the shared map by reusing the existing
+  // selection pathway, so SCENARIOS gets route geometry without a second map.
+  const scenarioRouteId = scenarioBaseline?.original_route_id ?? null;
+  useEffect(() => {
+    if (mode !== "scenarios" || !scenarioRouteId) return;
+    setSelectedRouteId((current) => (current === scenarioRouteId ? current : scenarioRouteId));
+  }, [mode, scenarioRouteId]);
+
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) return;
+    // MapLibre 6 resolves its tile-parsing worker from `import.meta.url`, which
+    // after bundling points into `/_next/static/chunks/` where the worker file
+    // does not exist.  The 404 returns Next's HTML shell, the browser rejects
+    // the module worker on MIME type, and every vector tile then fails to parse
+    // silently — no vector source ever loads and `load` never fires.  Point at
+    // the copy `scripts/copy-maplibre-worker.mjs` places in `public/`.
+    setWorkerUrl(MAPLIBRE_WORKER_URL);
     const map = new Map({
       container: mapContainerRef.current,
-      style: MAP_STYLE,
+      // TransitPulse's own cartography, not an off-the-shelf basemap: see
+      // `mapStyle.ts` for why the stock style competes with the transit data.
+      style: transitPulseBasemapStyle(),
       center: EDMONTON_CENTER,
       zoom: 10.5,
       attributionControl: false,
+      // The stock zoom/compass widget is replaced by `MapControls`, which
+      // matches the rest of the console and offers fit-route and layer toggles.
+      dragRotate: false,
     });
+    map.touchZoomRotate.disableRotation();
     map.on("error", (event) => {
       const reason = event.error instanceof Error ? event.error.message : "MapLibre could not render the map";
+      // An unreachable tile host (an offline demo, a CARTO outage) still lets
+      // MapLibre fire `load`, because the transit layers are local data. That
+      // must read as "no basemap", not replace the route list with an error,
+      // and the CARTO/OpenStreetMap credit must not stay up over blank ground.
+      const sourceId = (event as { sourceId?: string }).sourceId;
+      if (sourceId === "carto" || /cartocdn|tiles\.json|\.pbf|Failed to fetch|AJAXError/i.test(reason)) {
+        basemapFailedRef.current = true;
+        setBasemapFailure("the tile server could not be reached");
+        if (attributionRef.current) {
+          map.removeControl(attributionRef.current);
+          attributionRef.current = null;
+        }
+        return;
+      }
       setNetworkState("error");
       setNetworkMessage(`Map error: ${reason}`);
     });
-    map.addControl(new NavigationControl({ showCompass: false }), "bottom-right");
-    map.addControl(new AttributionControl({ compact: true }), "bottom-right");
+    // A lost GPU context stops tiles rendering with no error of its own, which
+    // otherwise shows up as an unexplained blank basemap. Say what happened and
+    // fall back to the measured-geometry view rather than leaving a dead canvas.
+    map.on("webglcontextlost", () => {
+      setMapReady(false);
+      setBasemapFailure("the browser released the map's GPU context");
+    });
+    map.on("webglcontextrestored", () => setBasemapFailure(null));
     map.on("load", () => {
+      setMapReady(true);
+      // Credit the basemap only once it has actually rendered.  Showing this
+      // while only the local fallback is drawn attributes geometry to CARTO
+      // and OpenStreetMap that they did not supply.
+      if (!basemapFailedRef.current) {
+        attributionRef.current = new AttributionControl({ compact: true });
+        // Top-right: the bottom-right corner belongs to the map controls.
+        map.addControl(attributionRef.current, "top-right");
+      }
       map.addSource("network-routes", { type: "geojson", data: EMPTY_COLLECTION });
       map.addLayer({
         id: "network-routes-line",
         type: "line",
         source: "network-routes",
+        layout: { "line-cap": "round", "line-join": "round" },
         paint: {
-          "line-color": "#64748b",
-          "line-width": 1.25,
+          "line-color": ROUTE_COLORS.network,
+          "line-width": networkLineWidth(),
           "line-opacity": 0.42,
         },
       });
@@ -798,15 +1118,28 @@ export default function Home() {
         id: "selected-route-casing",
         type: "line",
         source: "selected-route",
-        paint: { "line-color": "#ffffff", "line-width": 7, "line-opacity": 0.92 },
+        layout: { "line-cap": "round", "line-join": "round" },
+        paint: {
+          "line-color": ROUTE_COLORS.selectedCasing,
+          "line-width": selectedRouteCasingWidth(),
+          "line-opacity": 0.95,
+        },
       });
       map.addLayer({
         id: "selected-route-line",
         type: "line",
         source: "selected-route",
+        layout: { "line-cap": "round", "line-join": "round" },
         paint: {
-          "line-color": ["coalesce", ["get", "color"], "#ea580c"],
-          "line-width": 4.5,
+          // GTFS route_color is published without a leading "#", which MapLibre
+          // cannot parse and silently renders as black.
+          "line-color": [
+            "case",
+            ["has", "color"],
+            ["concat", "#", ["get", "color"]],
+            ROUTE_COLORS.selected,
+          ],
+          "line-width": selectedRouteWidth(),
           "line-opacity": 1,
         },
       });
@@ -815,13 +1148,23 @@ export default function Home() {
         id: "selected-stops-casing",
         type: "circle",
         source: "selected-stops",
-        paint: { "circle-radius": 6, "circle-color": "#ffffff", "circle-stroke-width": 0 },
+        paint: {
+          "circle-radius": stopCasingRadius(),
+          "circle-color": "#ffffff",
+          "circle-stroke-width": 0,
+          "circle-opacity": 0.95,
+        },
       });
       map.addLayer({
         id: "selected-stops-dot",
         type: "circle",
         source: "selected-stops",
-        paint: { "circle-radius": 3.4, "circle-color": "#0f172a", "circle-stroke-color": "#ffffff", "circle-stroke-width": 1 },
+        paint: {
+          "circle-radius": stopRadius(),
+          "circle-color": "#1e3a4c",
+          "circle-stroke-color": "#ffffff",
+          "circle-stroke-width": 1,
+        },
       });
       map.addSource("reliability-stops", { type: "geojson", data: EMPTY_COLLECTION });
       map.addLayer({
@@ -850,57 +1193,85 @@ export default function Home() {
         id: "live-vehicles-halo",
         type: "circle",
         source: "live-vehicles",
-        paint: { "circle-radius": 9, "circle-color": "#f97316", "circle-opacity": 0.18 },
+        paint: {
+          "circle-radius": ["interpolate", ["linear"], ["zoom"], 9, 6, 14, 13],
+          "circle-color": vehicleColorExpression,
+          "circle-opacity": 0.16,
+        },
       });
+      // The coloured disc under the chevron: the icon itself is white-and-dark
+      // so it stays legible, and state is carried by this disc beneath it.
       map.addLayer({
         id: "live-vehicles-dot",
         type: "circle",
         source: "live-vehicles",
         paint: {
-          "circle-radius": ["case", ["boolean", ["feature-state", "selected"], false], 7, 5],
-          "circle-color": ["case", ["has", "delay_seconds"], "#f97316", "#0284c7"],
+          "circle-radius": ["case", ["boolean", ["feature-state", "selected"], false], 8, 6],
+          "circle-color": vehicleColorExpression,
           "circle-stroke-color": "#ffffff",
-          "circle-stroke-width": 1.5,
+          "circle-stroke-width": 1.6,
         },
       });
-      map.on("click", "selected-stops-dot", (event) => {
-        const feature = event.features?.[0];
-        const coordinates = (feature?.geometry as Point | undefined)?.coordinates;
-        const name = feature?.properties?.name as string | undefined;
-        const stopId = feature?.properties?.stop_id as string | undefined;
-        if (!coordinates || !name) return;
-        new Popup({ offset: 12 })
-          .setLngLat(coordinates as [number, number])
-          .setHTML(`<strong>${name}</strong><br/><span>${stopId ?? ""}</span>`)
-          .addTo(map);
+      const icon = vehicleIcon();
+      if (icon && !map.hasImage("tp-vehicle")) {
+        map.addImage("tp-vehicle", icon, { pixelRatio: 2 });
+      }
+      // Heading is drawn only where the feed actually reports one. Rotating a
+      // marker by a default of 0 would point every unknown-bearing vehicle due
+      // north, which reads as information and is not.
+      map.addLayer({
+        id: "live-vehicles-heading",
+        type: "symbol",
+        source: "live-vehicles",
+        filter: ["has", "bearing"],
+        layout: {
+          "icon-image": "tp-vehicle",
+          "icon-size": vehicleIconSize("live"),
+          "icon-rotate": ["get", "bearing"],
+          "icon-rotation-alignment": "map",
+          "icon-allow-overlap": true,
+          "icon-ignore-placement": true,
+        },
+        paint: { "icon-opacity": 0.96 },
       });
-      map.on("mouseenter", "selected-stops-dot", () => { map.getCanvas().style.cursor = "pointer"; });
-      map.on("mouseleave", "selected-stops-dot", () => { map.getCanvas().style.cursor = ""; });
-      map.on("click", "reliability-stops-dot", (event) => {
-        const feature = event.features?.[0] as Feature<Point, ReliabilityStopProperties> | undefined;
-        const coordinates = feature?.geometry?.coordinates;
-        const properties = feature?.properties;
-        if (!coordinates || !properties) return;
-        new Popup({ offset: 12 })
+      // One click handler and one popup. Per-layer handlers each opened their own
+      // popup, so a vehicle standing at a stop produced two stacked cards. The
+      // most specific thing under the cursor wins: vehicle, then reliability
+      // evidence, then the stop itself.
+      const showPopup = (coordinates: number[], html: string) => {
+        popupRef.current?.remove();
+        popupRef.current = new Popup({ offset: 12 })
           .setLngLat(coordinates as [number, number])
-          .setHTML(`<strong>${properties.name}</strong><br/><span>Recorded stop-sequence entries: ${properties.observation_count} · median delay: ${formatSeconds(properties.median_delay_seconds)}</span>`)
+          .setHTML(html)
           .addTo(map);
+      };
+      const clickableLayers = ["live-vehicles-dot", "reliability-stops-dot", "selected-stops-dot"];
+      map.on("click", (event) => {
+        for (const layer of clickableLayers) {
+          if (!map.getLayer(layer)) continue;
+          const [feature] = map.queryRenderedFeatures(event.point, { layers: [layer] });
+          if (!feature || feature.geometry.type !== "Point") continue;
+          const coordinates = feature.geometry.coordinates;
+          if (layer === "live-vehicles-dot") {
+            const properties = feature.properties as VehicleProperties;
+            setSelectedVehicleId(properties.vehicle_id);
+            showPopup(coordinates, `<strong>Vehicle ${escapeHtml(properties.vehicle_id)}</strong><span>Route ${escapeHtml(properties.route_id ?? "unmatched")} · ${escapeHtml(formatDelay(properties.delay_seconds ?? null))}</span>`);
+          } else if (layer === "reliability-stops-dot") {
+            const properties = feature.properties as ReliabilityStopProperties;
+            showPopup(coordinates, `<strong>${escapeHtml(properties.name)}</strong><span>${properties.observation_count} recorded stop arrivals · median delay ${escapeHtml(formatSignedSeconds(properties.median_delay_seconds ?? null))}</span>`);
+          } else {
+            const name = feature.properties?.name as string | undefined;
+            if (!name) continue;
+            const stopId = feature.properties?.stop_id as string | undefined;
+            showPopup(coordinates, `<strong>${escapeHtml(name)}</strong><span>Stop ${escapeHtml(stopId ?? "")}</span>`);
+          }
+          return;
+        }
       });
-      map.on("mouseenter", "reliability-stops-dot", () => { map.getCanvas().style.cursor = "pointer"; });
-      map.on("mouseleave", "reliability-stops-dot", () => { map.getCanvas().style.cursor = ""; });
-      map.on("click", "live-vehicles-dot", (event) => {
-        const feature = event.features?.[0] as Feature<Point, VehicleProperties> | undefined;
-        const coordinates = feature?.geometry?.coordinates;
-        const properties = feature?.properties;
-        if (!coordinates || !properties) return;
-        setSelectedVehicleId(properties.vehicle_id);
-        new Popup({ offset: 12 })
-          .setLngLat(coordinates as [number, number])
-          .setHTML(`<strong>Vehicle ${properties.vehicle_id}</strong><br/><span>Route ${properties.route_id ?? "unmatched"} · ${formatDelay(properties.delay_seconds)}</span>`)
-          .addTo(map);
-      });
-      map.on("mouseenter", "live-vehicles-dot", () => { map.getCanvas().style.cursor = "pointer"; });
-      map.on("mouseleave", "live-vehicles-dot", () => { map.getCanvas().style.cursor = ""; });
+      for (const layer of clickableLayers) {
+        map.on("mouseenter", layer, () => { map.getCanvas().style.cursor = "pointer"; });
+        map.on("mouseleave", layer, () => { map.getCanvas().style.cursor = ""; });
+      }
       setMapLoaded(true);
     });
     mapRef.current = map;
@@ -1002,6 +1373,7 @@ export default function Home() {
           setAnalyticsMessage("Insufficient recorded history");
           return;
         }
+        analyticsAutoWindowRef.current = true;
         setAnalyticsStart(new Date(start).toISOString());
         setAnalyticsEnd(new Date(last).toISOString());
         const duration = last - start;
@@ -1063,16 +1435,31 @@ export default function Home() {
       .then((result) => {
         if (abortController.signal.aborted) return;
         setAnalytics(result);
-        setAnalyticsMessage(`${result.observation_count.toLocaleString()} recorded observations in this bounded range.`);
+        setAnalyticsMessage(`${result.observation_count.toLocaleString()} recorded observations in this range.`);
       })
       .catch((error: unknown) => {
-        if (!abortController.signal.aborted) {
-          setAnalytics(null);
-          setAnalyticsMessage(error instanceof Error ? error.message : "Reliability analytics could not be loaded.");
+        if (abortController.signal.aborted) return;
+        const start = Date.parse(analyticsStart);
+        const end = Date.parse(analyticsEnd);
+        const tooMany = error instanceof Error && error.message.includes("more than");
+        if (tooMany && analyticsAutoWindowRef.current && end - start > 30 * 60_000) {
+          // Halve the default window (keeping its end at the latest record) and
+          // move Period B to sit directly before it, then let this effect rerun.
+          const nextStart = end - (end - start) / 2;
+          const first = analyticsAvailability?.first_observed_at ? Date.parse(analyticsAvailability.first_observed_at) : nextStart;
+          const comparisonBegin = Math.max(first, nextStart - (end - nextStart));
+          setAnalyticsStart(new Date(nextStart).toISOString());
+          if (comparisonBegin < nextStart) {
+            setComparisonStart(new Date(comparisonBegin).toISOString());
+            setComparisonEnd(new Date(nextStart).toISOString());
+          }
+          return;
         }
+        setAnalytics(null);
+        setAnalyticsMessage(error instanceof Error ? error.message : "Reliability analytics could not be loaded.");
       });
     return () => abortController.abort();
-  }, [analyticsEnd, analyticsStart, mode, selectedRouteId]);
+  }, [analyticsAvailability, analyticsEnd, analyticsStart, mode, selectedRouteId]);
 
   useEffect(() => {
     if (!comparisonEnabled || mode !== "analytics" || !selectedRouteId || !analyticsStart || !analyticsEnd || !comparisonStart || !comparisonEnd) {
@@ -1113,6 +1500,10 @@ export default function Home() {
   useEffect(() => {
     if (!mapLoaded) return;
     const map = mapRef.current;
+    // Each mode gives the canvas a different height; MapLibre only notices on
+    // its next resize observation, so fitting first would frame the route for
+    // the previous mode's canvas and crop it.
+    map?.resize();
     const shapes = asFeatureCollection(selectedShapes);
     const stops = asFeatureCollection(selectedStops);
     (map?.getSource("selected-route") as GeoJSONSource | undefined)?.setData(shapes);
@@ -1127,9 +1518,9 @@ export default function Home() {
         (result, coordinate) => result.extend(coordinate),
         new LngLatBounds(coordinates[0], coordinates[0]),
       );
-      map.fitBounds(bounds, { padding: { top: 80, bottom: 80, left: 420, right: 80 }, maxZoom: 14, duration: 500 });
+      map.fitBounds(bounds, { padding: mapFitPadding(mapContainerRef.current), maxZoom: 14, duration: 500 });
     }
-  }, [mapLoaded, selectedShapes, selectedStops]);
+  }, [mapLoaded, mode, selectedShapes, selectedStops]);
 
   const filteredRoutes = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -1148,6 +1539,24 @@ export default function Home() {
     [displayedVehicles, selectedVehicleId],
   );
   const vehicleFeed = feedStatus(realtimeStatus, "vehicle_positions");
+  // ETS publishes one alert per affected route, so the same stop closure appears
+  // as several identical cards. Cards merge on title, effect and period.
+  const groupedAlerts = useMemo(() => {
+    const groups = new globalThis.Map<string, RealtimeAlert>();
+    for (const alert of networkAlerts) {
+      const key = `${alert.header ?? ""}|${alert.effect ?? ""}|${alert.active_periods[0]?.start ?? ""}|${alert.active_periods[0]?.end ?? ""}`;
+      const existing = groups.get(key);
+      if (existing) {
+        groups.set(key, { ...existing, affected_routes: [...new Set([...existing.affected_routes, ...alert.affected_routes])] });
+      } else {
+        groups.set(key, alert);
+      }
+    }
+    return [...groups.values()];
+  }, [networkAlerts]);
+  // The API caps the issue list, so the count comes from every inspectable
+  // route with an attention score rather than from the capped list's length.
+  const flaggedRouteCount = networkHealth?.routes.filter((route) => ATTENTION_STATES.has(route.service_status) && (route.short_name || route.long_name)).length ?? 0;
   const replayProgress = useMemo(() => {
     if (!replayStart || !replayEnd || !replayTimestamp) return 0;
     const start = Date.parse(replayStart);
@@ -1176,16 +1585,26 @@ export default function Home() {
           <div><strong>TransitPulse</strong><span>Edmonton Operations</span></div>
         </div>
         <nav className="primary-modes" aria-label="Product mode">
-          {(["live", "replay", "analytics"] as AppMode[]).map((option) => (
-            <button className={mode === option ? "active" : ""} key={option} onClick={() => updateMode(option)} type="button">
-              {option}
+          {MODES.map((option) => (
+            <button
+              className={mode === option.id ? "active" : ""}
+              key={option.id}
+              onClick={() => updateMode(option.id)}
+              title={option.question}
+              type="button"
+            >
+              <strong>{option.label}</strong>
+              <small>{option.question}</small>
             </button>
           ))}
         </nav>
         <div className="ops-clock">
           <span className={`live-pill ${realtimeStatus?.stale ? "stale" : ""}`}><i />{realtimeStatus?.stale ? "STALE" : mode.toUpperCase()}</span>
           <time>{formatRealtimeTime(mode === "replay" ? replayTimestamp : networkHealth?.generated_at)}</time>
-          <small>America/Edmonton</small>
+          <small>
+            {mode === "replay" ? "Playhead · " : ""}America/Edmonton
+            <a className="research-link" href="/research/model-lab">Research</a>
+          </small>
         </div>
       </header>
 
@@ -1194,63 +1613,129 @@ export default function Home() {
           <div className="summary-heading"><span>Network now</span><strong>{networkHealth?.stale ? "Feed delayed" : "Current operations"}</strong></div>
           <div className="kpi"><span>Active vehicles</span><strong>{networkHealth?.active_vehicles ?? "—"}</strong><small>direct live positions</small></div>
           <div className="kpi"><span>Routes operating</span><strong>{networkHealth?.routes_with_live_service ?? "—"}</strong><small>with live vehicles</small></div>
-          <div className="kpi warning"><span>Delayed routes</span><strong>{networkHealth?.routes_delayed ?? "—"}</strong><small>outside tolerance</small></div>
-          <div className="kpi critical"><span>Bunching</span><strong>{networkHealth?.routes_with_bunching ?? "—"}</strong><small>routes flagged</small></div>
-          <div className="kpi critical"><span>Service gaps</span><strong>{networkHealth?.routes_with_service_gaps ?? "—"}</strong><small>routes flagged</small></div>
+          <div className="kpi warning"><span>Routes with late trips</span><strong>{networkHealth?.routes_delayed ?? "—"}</strong><small>a trip over 1 min late</small></div>
+          <div className="kpi critical"><span>Bunching</span><strong>{networkHealth?.routes_with_bunching ?? "—"}</strong><small>{networkHealth?.routes_with_bunching === 1 ? "route flagged" : "routes flagged"}</small></div>
+          <div className="kpi critical"><span>Service gaps</span><strong>{networkHealth?.routes_with_service_gaps ?? "—"}</strong><small>{networkHealth?.routes_with_service_gaps === 1 ? "route flagged" : "routes flagged"}</small></div>
           <div className="kpi"><span>Active alerts</span><strong>{networkHealth?.active_alerts ?? "—"}</strong><small>publisher supplied</small></div>
         </>}
         {mode === "replay" && <>
           <div className="summary-heading"><span>Recorded service</span><strong>Historical replay</strong></div>
           <div className="kpi"><span>Replay vehicles</span><strong>{displayedVehicles?.features.length ?? 0}</strong><small>at playhead</small></div>
-          <div className="kpi"><span>Loaded observations</span><strong>{replayHistory?.features.length.toLocaleString() ?? "—"}</strong><small>bounded request</small></div>
-          <div className="kpi"><span>Recorded total</span><strong>{replayAvailability?.observation_count.toLocaleString() ?? "—"}</strong><small>current static feed</small></div>
+          <div className="kpi"><span>Loaded observations</span><strong>{replayHistory?.features.length.toLocaleString() ?? "—"}</strong><small>in the loaded window</small></div>
+          <div className="kpi"><span>Recorded observations</span><strong>{replayAvailability?.observation_count.toLocaleString() ?? "—"}</strong><small>{selectedRoute ? `route ${selectedRoute.short_name ?? selectedRoute.route_id}` : "all recorded routes"}</small></div>
           <div className="kpi wide"><span>Playhead</span><strong>{formatReplayTime(replayTimestamp)}</strong><small>{selectedRoute ? `Route ${selectedRoute.short_name ?? selectedRoute.route_id}` : "All recorded routes"}</small></div>
+        </>}
+        {mode === "scenarios" && <>
+          <div className="summary-heading"><span>Planning scenario</span><strong>{scenarioBaseline ? `Route ${scenarioBaseline.route_label}` : "Select a route"}</strong></div>
+          <div className="kpi"><span>Scheduled runtime</span><strong>{scenarioBaseline?.scheduled_runtime_minutes != null ? `${scenarioBaseline.scheduled_runtime_minutes.toFixed(0)} min` : "—"}</strong><small>published, one way</small></div>
+          <div className="kpi"><span>Estimated runtime</span><strong>{scenarios.result ? `${scenarios.result.estimate.runtime_minutes.point.toFixed(0)} min` : "—"}</strong><small>{!scenarios.result || scenarioUnchanged ? "no change yet" : scenarioSpeedHeld ? "held at schedule" : `range ${scenarios.result.estimate.runtime_minutes.low.toFixed(0)}–${scenarios.result.estimate.runtime_minutes.high.toFixed(0)}`}</small></div>
+          <div className="kpi"><span>Commercial speed</span><strong>{scenarios.result ? `${scenarios.result.estimate.commercial_speed_kmh.point.toFixed(1)}` : "—"}</strong><small>{scenarioUnchanged || scenarioSpeedHeld ? "km/h, as scheduled" : "km/h, estimated"}</small></div>
+          <div className="kpi"><span>Est. vehicles</span><strong>{scenarios.result?.estimate.fleet ? wholeVehicles(scenarios.result.estimate.fleet.vehicles.point) : "—"}</strong><small>{scenarios.result?.estimate.fleet ? `ratio ${scenarios.result.estimate.fleet.vehicles.point.toFixed(2)}, rounded up` : "estimated requirement"}</small></div>
+          <div className={`kpi ${scenarioUnchanged || scenarioSpeedHeld ? "" : scenarios.result?.estimate.confidence === "low" ? "critical" : scenarios.result?.estimate.confidence === "moderate" ? "warning" : ""}`}><span>Confidence</span><strong>{!scenarios.result ? "—" : scenarioUnchanged || scenarioSpeedHeld ? "N/A" : scenarios.result.estimate.confidence.toUpperCase()}</strong><small>{scenarioUnchanged ? "nothing changed yet" : scenarioSpeedHeld ? "no model used" : "from held-out skill"}</small></div>
+          <div className="kpi wide"><span>Basis</span><strong>{!scenarios.result ? "—" : scenarioUnchanged ? "SCHEDULE" : scenarioSpeedHeld ? "ARITHMETIC" : "ESTIMATE"}</strong><small>{scenarioUnchanged ? "published GTFS timetable" : scenarioSpeedHeld ? "schedule + recovery rule" : "8-city planning model"}</small></div>
         </>}
         {mode === "analytics" && <>
           <div className="summary-heading"><span>Route history</span><strong>{selectedRoute ? routeLabel(selectedRoute) : "Select a route"}</strong></div>
-          <div className="kpi"><span>Observations</span><strong>{analytics?.observation_count.toLocaleString() ?? "—"}</strong><small>bounded range</small></div>
+          <div className="kpi"><span>Observations</span><strong>{analytics?.observation_count.toLocaleString() ?? "—"}</strong><small>all records in range</small></div>
           <div className="kpi"><span>Vehicles observed</span><strong>{analytics?.observed_vehicle_count ?? "—"}</strong><small>distinct identifiers</small></div>
           <div className="kpi"><span>Coverage</span><strong>{formatCoverage(analytics?.coverage_duration_seconds)}</strong><small>first to last record</small></div>
           <div className="kpi"><span>Median delay</span><strong>{analytics?.sufficient_history ? formatSignedSeconds(analytics.delay_distribution.median_seconds) : "—"}</strong><small>observed</small></div>
           <div className="kpi"><span>P90 delay</span><strong>{analytics?.sufficient_history ? formatSignedSeconds(analytics.delay_distribution.percentile_90_seconds) : "—"}</strong><small>observed</small></div>
-          <div className="kpi"><span>Observed headway</span><strong>{analytics?.observed_headways.sufficient ? formatSeconds(analytics.observed_headways.median_seconds) : "—"}</strong><small>stop-sequence entries</small></div>
+          <div className="kpi"><span>Observed headway</span><strong>{analytics?.observed_headways.sufficient ? formatSeconds(analytics.observed_headways.median_seconds) : "—"}</strong><small>{analytics?.observed_headways.sufficient ? `1 stop · ${plural(analytics.observed_headways.sample_count, "interval")}` : "one sampled stop"}</small></div>
         </>}
       </section>
 
       <section className={`map-pane mode-${mode}`} aria-label="Edmonton transit operations workspace">
         <div className="map" ref={mapContainerRef} />
-        <TransitMapFallback
+        {(!mapReady || basemapFailure) && <p className="map-basemap-notice" role="status">
+          {basemapFailure
+            ? `No basemap — ${basemapFailure}. Transit data is still shown.`
+            : "No basemap — showing measured route geometry only"}
+        </p>}
+        {!mapReady && <TransitMapFallback
           networkShapes={networkShapes}
           selectedShapes={selectedShapes}
           selectedStops={selectedStops}
           reliabilityStops={analytics?.spatial_reliability ?? null}
           vehicles={displayedVehicles}
-        />
-        <div className="map-brand">
+        />}
+        <div className={`map-context mode-${mode}`}>
           <span className="pulse-mark" aria-hidden="true">●</span>
-          <div><strong>TransitPulse</strong><span>Edmonton live operations</span></div>
+          <div>
+            <strong>{mode === "replay" ? "Recorded history" : mode === "analytics" ? "Recorded analytics" : mode === "scenarios" ? "Planning scenario" : "Live network"}</strong>
+            <span>{mode === "replay" ? formatReplayTime(replayTimestamp) : mode === "analytics" ? (selectedRoute ? routeLabel(selectedRoute) : "Select a route") : mode === "scenarios" ? (scenarioBaseline ? `Route ${scenarioBaseline.route_label} · current alignment` : "Select a route") : formatRealtimeTime(networkHealth?.generated_at)}</span>
+          </div>
         </div>
-        <div className="map-legend"><span className="legend-line" /> Static network <span className={mode === "analytics" ? "legend-reliability" : "legend-vehicle"} /> {mode === "replay" ? "Replay vehicles" : mode === "analytics" ? "Reliability evidence" : "Live vehicles"}</div>
+        <MapControls
+          canFitRoute={Boolean(selectedShapes?.features.length)}
+          layers={mapLayers}
+          onFitNetwork={fitNetwork}
+          onFitRoute={fitSelectedRoute}
+          onToggle={(layer) => setMapLayers((previous) => ({ ...previous, [layer]: !previous[layer] }))}
+          onZoom={(delta) => mapRef.current?.easeTo({ zoom: (mapRef.current?.getZoom() ?? 10.5) + delta, duration: 260 })}
+          showVehicleToggle={mode === "live" || mode === "replay"}
+        />
+        {mode === "scenarios" && <div className="scenario-map-note" role="note">
+          <strong>Current alignment only</strong>
+          <span>
+            A scenario changes <em>length</em> and <em>stop count</em>, not the path. No proposed
+            alignment is drawn: the model has no road network to place it on.
+          </span>
+        </div>}
+        <div className="map-legend">
+          <span className="legend-line" /> Static network
+          {mode === "analytics" ? <>
+            <span className="legend-dot" style={{ background: "#0f766e" }} /> Good
+            <span className="legend-dot" style={{ background: "#f59e0b" }} /> Moderate
+            <span className="legend-dot" style={{ background: "#e11d48" }} /> Poor
+            <span className="legend-dot" style={{ background: "#64748b" }} /> No delay data
+          </> : <>
+            <span className="legend-group">{mode === "replay" ? "Recorded vehicles" : "Vehicles"}</span>
+            <span className="legend-dot" style={{ background: VEHICLE_COLORS.normal }} /> On time
+            <span className="legend-dot" style={{ background: VEHICLE_COLORS.delayed }} /> 1–5 min late
+            <span className="legend-dot" style={{ background: VEHICLE_COLORS.severe }} /> 5+ min late
+            <span className="legend-dot" style={{ background: VEHICLE_COLORS.unknown }} /> No delay data
+          </>}
+        </div>
+        {mode === "scenarios" && <section className="network-intelligence scenario-band" aria-label="Current plan versus proposed scenario">
+          {scenarios.unavailableReason ? (
+            <div className="intelligence-column">
+              <div className="panel-heading"><div><p className="eyebrow">SCENARIOS</p><h2>Estimator unavailable</h2></div></div>
+              <p className="panel-empty">{scenarios.unavailableReason}{scenarios.unavailableReason === API_NOT_RESPONDING ? null : <><br />Build it with <code>scripts/build_cross_city_dataset.py</code> then <code>scripts/build_scenario_estimator.py</code>.</>}</p>
+            </div>
+          ) : (
+            <>
+              <CurrentPlanPanel baseline={scenarioBaseline} />
+              <EstimatePanel pending={scenarios.pending} result={scenarios.result} />
+              {/* The per-change-size skill describes the speed model; for an unchanged
+                  plan or a frequency-only edit that model is not used, so the card
+                  falls back to Edmonton's overall held-out figure. */}
+              <ModelCardPanel designDistance={scenarioUnchanged || scenarioSpeedHeld ? null : scenarios.result?.estimate.design_distance ?? null} model={scenarios.model} />
+            </>
+          )}
+          {scenarios.error && <p className="scenario-error" role="status">{scenarios.error}</p>}
+        </section>}
+
         {mode === "live" && <section className="network-intelligence" aria-label="Network issues and service alerts">
           <div className="intelligence-column">
-            <div className="panel-heading"><div><p className="eyebrow">PRIORITY QUEUE</p><h2>Routes needing attention</h2></div><span>{networkHealth?.issues.length ?? 0} flagged</span></div>
+            <div className="panel-heading"><div><p className="eyebrow">PRIORITY QUEUE</p><h2>Routes needing attention</h2></div><span>{flaggedRouteCount > 5 ? `top 5 of ${flaggedRouteCount} flagged` : `${flaggedRouteCount} flagged`}</span></div>
             <div className="issue-list">
               {networkHealth?.issues.slice(0, 5).map((issue, index) => (
                 <button key={issue.route_id} onClick={() => setSelectedRouteId(issue.route_id)} type="button">
                   <span className="issue-rank">{String(index + 1).padStart(2, "0")}</span>
                   <span className="issue-route">Route {routeDisplayName(issue)}<small>{issue.long_name ?? issue.route_id}</small></span>
                   <span className={`status-badge ${statusClass(issue.service_status)}`}>{statusLabel(issue.service_status)}</span>
-                  <span className="issue-evidence">{issue.service_gap && issue.predicted_headways_seconds.length ? `Largest gap ${formatSeconds(Math.max(...issue.predicted_headways_seconds))}` : issue.bunching ? `${issue.predicted_headways_seconds.filter((value) => issue.headway_baseline_seconds && value < issue.headway_baseline_seconds * .5).length} close pairs` : `${issue.delayed_vehicle_count} delayed · ${formatSignedSeconds(issue.average_delay_seconds)}`}</span>
+                  <span className="issue-evidence">{issueEvidence(issue)}</span>
                 </button>
               ))}
               {networkHealth && networkHealth.issues.length === 0 && <p className="panel-empty">{networkHealth.stale ? "Live vehicle snapshot is stale; current route issues are withheld." : "No current route-level exceptions detected."}</p>}
-              {!networkHealth && <p className="panel-empty">Loading live network health…</p>}
+              {!networkHealth && <p className="panel-empty">{apiStatus === "offline" ? API_NOT_RESPONDING : "Loading live network health…"}</p>}
             </div>
           </div>
           <div className="intelligence-column alerts-column">
             <div className="panel-heading"><div><p className="eyebrow">SERVICE ALERTS</p><h2>Publisher notices</h2></div><span>{networkAlerts.length} active</span></div>
             <div className="alert-list">
-              {networkAlerts.slice(0, 4).map((alert) => (
+              {groupedAlerts.slice(0, 4).map((alert) => (
                 <button disabled={!alert.affected_routes.length} key={alert.id} onClick={() => alert.affected_routes[0] && setSelectedRouteId(alert.affected_routes[0])} type="button">
                   <span className="alert-effect">{alert.effect?.replaceAll("_", " ") ?? "NOTICE"}</span>
                   <strong>{alert.header ?? "Service advisory"}</strong>
@@ -1263,12 +1748,57 @@ export default function Home() {
           </div>
         </section>}
 
+        {mode === "replay" && <section className="network-intelligence" aria-label="Replay evidence at the playhead">
+          <div className="intelligence-column">
+            <div className="panel-heading"><div><p className="eyebrow">AT THE PLAYHEAD</p><h2>Recorded vehicles</h2></div><span>{plural(displayedVehicles?.features.length ?? 0, "vehicle")}</span></div>
+            <div className="issue-list">
+              {(displayedVehicles?.features ?? []).slice(0, 40).map((feature, index) => (
+                <button
+                  className={`issue-row ${selectedVehicleId === feature.properties.vehicle_id ? "selected" : ""}`}
+                  key={`${feature.properties.vehicle_id}-${index}`}
+                  onClick={() => setSelectedVehicleId(feature.properties.vehicle_id)}
+                  type="button"
+                >
+                  <span className="issue-rank">{index + 1}</span>
+                  <span className="issue-route">Vehicle {feature.properties.vehicle_id}<small>{feature.properties.route_id ? `Route ${feature.properties.route_id}` : "No route reported"}</small></span>
+                  <span className={`status-badge ${feature.properties.delay_seconds === null ? "" : feature.properties.delay_seconds > 300 ? "major-delay" : feature.properties.delay_seconds > 60 ? "minor-delay" : feature.properties.delay_seconds < -60 ? "early" : "on-time"}`}>
+                    {formatSignedSeconds(feature.properties.delay_seconds ?? null)}
+                  </span>
+                  <span className="issue-evidence">{formatRealtimeTime(feature.properties.timestamp)}</span>
+                </button>
+              ))}
+              {!displayedVehicles?.features.length && <p className="panel-empty">No recorded vehicles at this playhead. Move the playhead or widen the window.</p>}
+            </div>
+          </div>
+          <div className="intelligence-column">
+            <div className="panel-heading"><div><p className="eyebrow">LOADED WINDOW</p><h2>Observation coverage</h2></div><span>{replayHistory?.features.length.toLocaleString() ?? "—"} loaded</span></div>
+            {replayCoverage.length > 0 ? <>
+              <div className="delay-plot">
+                <div className="delay-axis" aria-hidden="true">
+                  <span style={{ bottom: "100%" }}>{replayCoveragePeak}</span>
+                  <span style={{ bottom: "0%" }}>0</span>
+                </div>
+                <div className="timeline-bars large">
+                  {replayCoverage.map((bucket) => (
+                    <div className="timeline-bar-slot" key={bucket.start} title={`${formatReplayTime(bucket.start)}: ${plural(bucket.count, "observation")}`}>
+                      <i className={bucket.count ? "on-time" : "no-data"} style={{ height: `${bucket.count ? Math.max(6, Math.round((bucket.count / replayCoveragePeak) * 100)) : 100}%` }} />
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="timeline-labels"><span>{formatReplayTime(replayStart)}</span><span>{formatReplayTime(replayEnd)}</span></div>
+              <div className="chart-legend"><span><i className="swatch on-time" />Recorded observations</span><span><i className="swatch no-data" />No records in bucket</span></div>
+              <p className="metric-basis">Recorded GTFS-Realtime vehicle positions in this window. Gaps are recording gaps, not proof that no service ran.</p>
+            </> : <p className="panel-empty">Load a replay window to see recorded coverage.</p>}
+          </div>
+        </section>}
+
         {mode === "analytics" && <section className="analytics-workspace" aria-label="Route reliability analytics">
           <div className="analytics-heading">
             <div><p className="eyebrow">RECORDED RELIABILITY</p><h2>{selectedRoute ? routeLabel(selectedRoute) : "Choose a route to begin"}</h2></div>
             {analyticsAvailability?.first_observed_at && analyticsAvailability.last_observed_at && analyticsStart && analyticsEnd && <div className="analytics-heading-actions"><div className="analytics-date-grid period-a">
-              <label>Period A from<input aria-label="Reliability analysis start" type="datetime-local" min={toDateTimeLocalValue(analyticsAvailability.first_observed_at)} max={toDateTimeLocalValue(analyticsAvailability.last_observed_at)} value={toDateTimeLocalValue(analyticsStart)} onChange={(event) => { const next = new Date(event.target.value); if (!Number.isNaN(next.valueOf())) setAnalyticsStart(next.toISOString()); }} /></label>
-              <label>Period A to<input aria-label="Reliability analysis end" type="datetime-local" min={toDateTimeLocalValue(analyticsAvailability.first_observed_at)} max={toDateTimeLocalValue(analyticsAvailability.last_observed_at)} value={toDateTimeLocalValue(analyticsEnd)} onChange={(event) => { const next = new Date(event.target.value); if (!Number.isNaN(next.valueOf())) setAnalyticsEnd(next.toISOString()); }} /></label>
+              <label>Period A from<input aria-label="Reliability analysis start" type="datetime-local" min={toDateTimeLocalValue(analyticsAvailability.first_observed_at)} max={toDateTimeLocalValue(analyticsAvailability.last_observed_at)} value={toDateTimeLocalValue(analyticsStart)} onChange={(event) => { const next = new Date(event.target.value); if (!Number.isNaN(next.valueOf())) { analyticsAutoWindowRef.current = false; setAnalyticsStart(next.toISOString()); }; }} /></label>
+              <label>Period A to<input aria-label="Reliability analysis end" type="datetime-local" min={toDateTimeLocalValue(analyticsAvailability.first_observed_at)} max={toDateTimeLocalValue(analyticsAvailability.last_observed_at)} value={toDateTimeLocalValue(analyticsEnd)} onChange={(event) => { const next = new Date(event.target.value); if (!Number.isNaN(next.valueOf())) { analyticsAutoWindowRef.current = false; setAnalyticsEnd(next.toISOString()); }; }} /></label>
             </div><button className={`comparison-toggle ${comparisonEnabled ? "active" : ""}`} disabled={!comparisonStart || !comparisonEnd} onClick={() => setComparisonEnabled((enabled) => !enabled)} type="button">{comparisonEnabled ? "Close comparison" : "Compare periods"}</button></div>}
           </div>
           {comparisonEnabled && analyticsAvailability?.first_observed_at && analyticsAvailability.last_observed_at && comparisonStart && comparisonEnd && <section className="comparison-workspace" aria-label="Historical period comparison">
@@ -1294,21 +1824,54 @@ export default function Home() {
           {!analytics && <div className="analytics-empty"><strong>{analyticsMessage}</strong><span>TransitPulse reports insufficient history instead of estimating unsupported metrics.</span></div>}
           {analytics && !analytics.sufficient_history && <div className="analytics-empty insufficient"><strong>Insufficient recorded history</strong><span>{analytics.sufficiency_reason}</span><small>{analytics.observation_count.toLocaleString()} observations from {analytics.observed_vehicle_count} vehicles across {formatCoverage(analytics.coverage_duration_seconds)}.</small></div>}
           {analytics?.sufficient_history && <div className="analytics-grid">
-            <article className="chart-card delay-chart"><div className="chart-title"><div><span>OBSERVED</span><h3>Median delay over time</h3></div><strong>{analytics.delay_distribution.sample_count.toLocaleString()} samples</strong></div>
-              <div className="timeline-bars large">{analytics.through_time.map((bucket) => <div className="timeline-bar-slot" key={bucket.start} title={`${formatReplayTime(bucket.start)}: ${formatSignedSeconds(bucket.median_delay_seconds)}`}><i className={bucket.delay_observation_count ? (Math.abs(bucket.median_delay_seconds ?? 0) > 60 ? "late" : "on-time") : "unknown"} style={{ height: `${reliabilityBarHeight(bucket.median_delay_seconds)}%` }} /></div>)}</div>
+            <article className="chart-card delay-chart"><div className="chart-title"><div><span>OBSERVED</span><h3>Median delay over time</h3></div><strong>{analytics.delay_distribution.sample_count.toLocaleString()} delay samples</strong></div>
+              <div className="delay-plot">
+                <div className="delay-axis" aria-hidden="true">
+                  {/* Bars and ticks share one scale fitted to the data, measured
+                      from the bars' baseline above the value labels. A fixed
+                      10-minute scale left typical delays as slivers and piled
+                      every tick label into the bottom fifth of the axis. */}
+                  {delayAxisTicks(analytics.through_time).map((tick) => (
+                    <span key={tick} style={{ bottom: `calc(${DELAY_LABEL_PX}px + (100% - ${DELAY_LABEL_PX}px) * ${tick / delayAxisCeiling(analytics.through_time)})` }}>{formatAxisMinutes(tick)}</span>
+                  ))}
+                </div>
+                <div className="timeline-bars large">{analytics.through_time.map((bucket) => {
+                  const hasData = bucket.delay_observation_count > 0;
+                  const fraction = hasData ? Math.max(0.04, Math.abs(bucket.median_delay_seconds ?? 0) / delayAxisCeiling(analytics.through_time)) : 1;
+                  return (
+                    <div
+                      className="timeline-bar-slot"
+                      key={bucket.start}
+                      title={hasData
+                        ? `${formatReplayTime(bucket.start)}: ${formatSignedSeconds(bucket.median_delay_seconds)} (${plural(bucket.delay_observation_count, "sample")})`
+                        : `${formatReplayTime(bucket.start)}: no observations recorded`}
+                    >
+                      <i
+                        className={hasData ? ((bucket.median_delay_seconds ?? 0) > 300 ? "late" : (bucket.median_delay_seconds ?? 0) > 60 ? "minor" : "on-time") : "no-data"}
+                        style={{ height: `calc((100% - ${DELAY_LABEL_PX}px) * ${fraction})` }}
+                      />
+                      <b className={hasData ? "" : "muted"}>{hasData ? formatSignedSeconds(bucket.median_delay_seconds) : "no data"}</b>
+                    </div>
+                  );
+                })}</div>
+              </div>
               <div className="timeline-labels"><span>{formatReplayTime(analytics.start)}</span><span>{formatReplayTime(analytics.end)}</span></div>
+              <div className="chart-legend"><span><i className="swatch on-time" />Within 1 min</span><span><i className="swatch minor" />1–5 min late</span><span><i className="swatch late" />Over 5 min late</span><span><i className="swatch no-data" />No observations</span></div>
               <div className="period-extremes"><span>Best <strong>{analytics.best_period_start ? formatReplayTime(analytics.best_period_start) : "—"}</strong></span><span>Worst <strong>{analytics.worst_period_start ? formatReplayTime(analytics.worst_period_start) : "—"}</strong></span></div>
             </article>
-            <article className="chart-card headway-card"><div className="chart-title"><div><span>OBSERVED vs SCHEDULED</span><h3>Service regularity</h3></div></div>
+            <article className="chart-card headway-card"><div className="chart-title"><div><span>OBSERVED vs SCHEDULED · ONE STOP</span><h3>Service regularity</h3></div></div>
+              <p className="metric-basis">{analytics.observed_headways.stop_name ?? "No matched stop"}{analytics.observed_headways.direction_id !== null && analytics.observed_headways.direction_id !== undefined ? ` · direction ${analytics.observed_headways.direction_id}` : ""} · {plural(analytics.observed_headways.sample_count, "adjacent headway")}. Not a route-wide headway.</p>
               {analytics.observed_headways.sufficient && analytics.scheduled_headways.sufficient ? <><div className="headway-bars"><div><span>Observed</span><i style={{ width: `${Math.min(100, ((analytics.observed_headways.median_seconds ?? 0) / Math.max(analytics.observed_headways.median_seconds ?? 1, analytics.scheduled_headways.median_seconds ?? 1)) * 100)}%` }} /><strong>{formatSeconds(analytics.observed_headways.median_seconds)}</strong></div><div><span>Scheduled</span><i className="scheduled" style={{ width: `${Math.min(100, ((analytics.scheduled_headways.median_seconds ?? 0) / Math.max(analytics.observed_headways.median_seconds ?? 1, analytics.scheduled_headways.median_seconds ?? 1)) * 100)}%` }} /><strong>{formatSeconds(analytics.scheduled_headways.median_seconds)}</strong></div></div>
-              <div className="headway-events"><span><strong>{analytics.observed_headways.bunching_event_count}</strong> bunching</span><span><strong>{analytics.observed_headways.service_gap_event_count}</strong> gaps</span><span><strong>{formatSeconds(analytics.observed_headways.variability_seconds)}</strong> variability</span></div></> : <div className="metric-insufficient"><strong>Insufficient observed headways</strong><span>{analytics.observed_headways.sample_count} comparable adjacent entries at {analytics.observed_headways.stop_name ?? "the sampled stop"}.</span></div>}
+              {analytics.observed_headways.sample_count >= MIN_HEADWAY_EVENT_SAMPLES
+                ? <div className="headway-events"><span><strong>{analytics.observed_headways.bunching_event_count}</strong> bunching</span><span><strong>{analytics.observed_headways.service_gap_event_count}</strong> {analytics.observed_headways.service_gap_event_count === 1 ? "gap" : "gaps"}</span><span><strong>{formatSeconds(analytics.observed_headways.variability_seconds)}</strong> variability</span></div>
+                : <p className="metric-basis withheld">Bunching, gap and variability counts are withheld below {MIN_HEADWAY_EVENT_SAMPLES} intervals.</p>}</> : <div className="metric-insufficient"><strong>Insufficient observed headways</strong><span>{analytics.observed_headways.sample_count} comparable adjacent entries at {analytics.observed_headways.stop_name ?? "the sampled stop"}.</span></div>}
             </article>
             <article className="chart-card distribution-card"><div className="chart-title"><div><span>OBSERVED</span><h3>Delay distribution</h3></div><strong>{analytics.delay_bands.sample_count.toLocaleString()} samples</strong></div>
               <div className="band-list">{delayBandRows.map((band) => <div key={band.label}><span>{band.label}</span><i><b className={band.tone} style={{ width: `${analytics.delay_bands.sample_count ? Math.max(2, band.count / analytics.delay_bands.sample_count * 100) : 0}%` }} /></i><strong>{band.count.toLocaleString()}</strong></div>)}</div>
             </article>
             <article className="chart-card evidence-card"><div className="chart-title"><div><span>DATA QUALITY</span><h3>Coverage and evidence</h3></div></div>
               <dl><div><dt>Distinct vehicles</dt><dd>{analytics.observed_vehicle_count}</dd></div><div><dt>Coverage</dt><dd>{formatCoverage(analytics.coverage_duration_seconds)}</dd></div><div><dt>Stop evidence</dt><dd>{analytics.spatial_reliability.features.length} stops</dd></div><div><dt>Analysis window</dt><dd>{formatCoverage((Date.parse(analytics.end) - Date.parse(analytics.start)) / 1000)}</dd></div></dl>
-              <p>Delay values are direct recorded observations. Headways are direct stop-sequence entries; schedule values come from static GTFS.</p>
+              <p>Delays are recorded observations. Headways come from recorded stop arrivals; scheduled values come from the static GTFS timetable.</p>
             </article>
           </div>}
         </section>}
@@ -1316,11 +1879,27 @@ export default function Home() {
 
       <aside className="route-sidebar">
         <header className="sidebar-header">
-          <p className="eyebrow">{mode === "replay" ? "HISTORICAL REPLAY" : mode === "analytics" ? "ROUTE CONTEXT" : "LIVE OPERATIONS"}</p>
-          <h1>{mode === "analytics" ? "Route reliability" : mode === "replay" ? "Replay workspace" : "Route inspector"}</h1>
-          <p className={`network-status ${networkState}`}>{networkMessage}</p>
-          {mode === "replay" ? (
+          <p className="eyebrow">{mode === "replay" ? "HISTORICAL REPLAY" : mode === "analytics" ? "ROUTE CONTEXT" : mode === "scenarios" ? "PLANNING SCENARIO" : "LIVE OPERATIONS"}</p>
+          <h1>{mode === "analytics" ? "Route reliability" : mode === "replay" ? "Replay workspace" : mode === "scenarios" ? "Service design" : "Route inspector"}</h1>
+          <p className={`network-status ${mode === "scenarios" ? "ready" : networkState}`}>
+            {mode === "scenarios"
+              ? scenarios.routes.length
+                ? `${new Set(scenarios.routes.map((route) => route.route_label)).size} Edmonton-region routes · published schedules`
+                : scenarios.unavailableReason ? "Scenario estimator unavailable" : "Loading scenario routes…"
+              : networkMessage}
+          </p>
+          {mode === "scenarios" ? (
+            // Live vehicle counts are irrelevant to a scheduled-design question,
+            // and printing them here invited reading a live position as evidence
+            // for a modelled claim — exactly what the map deliberately avoids.
+            <p className="realtime-status">
+              <i className="status-dot online" /> Scheduled service design
+              <small> · no live data is used in this mode</small>
+            </p>
+          ) : mode === "replay" ? (
             <p className="realtime-status"><i className="status-dot online" /> {displayedVehicles?.features.length ?? 0} replay vehicles <small> · {formatReplayTime(replayTimestamp)}</small></p>
+          ) : mode === "analytics" ? (
+            <p className="realtime-status"><i className="status-dot online" /> Recorded history <small> · {analyticsAvailability?.observation_count ? `${analyticsAvailability.observation_count.toLocaleString()} observations for this route` : "no live data is used in this view"}</small></p>
           ) : (
             <p className={`realtime-status ${realtimeStatus?.stale ? "stale" : ""}`}>
               <i className={`status-dot ${realtimeStatus && !realtimeStatus.stale ? "online" : "offline"}`} />
@@ -1384,6 +1963,20 @@ export default function Home() {
           </>}
         </section>
 
+        {mode === "scenarios" ? (
+          <ScenarioControls
+            baseline={scenarioBaseline}
+            edits={scenarios.edits}
+            onEdit={scenarios.edit}
+            onReset={scenarios.reset}
+            onSearch={scenarios.setSearch}
+            onSelect={scenarios.select}
+            routes={scenarios.routes}
+            search={scenarios.search}
+            selectedKey={scenarios.selectedKey}
+          />
+        ) : (
+        <>
         <div className="route-controls">
           <label className="search-label" htmlFor="route-search">Search routes</label>
           <input id="route-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Number or destination" />
@@ -1404,13 +1997,16 @@ export default function Home() {
           {networkState === "ready" && filteredRoutes.map((route) => (
             <button
               className={`route-row ${selectedRouteId === route.route_id ? "selected" : ""}`}
+              title={routeLabel(route)}
               key={route.route_id}
               onClick={() => setSelectedRouteId(route.route_id)}
               type="button"
             >
               <span className="route-chip" style={{ backgroundColor: `#${route.color ?? "334155"}`, color: `#${route.text_color ?? "FFFFFF"}` }}>{route.short_name ?? route.route_id}</span>
-              <span className="route-copy"><strong>{routeLabel(route)}</strong><small>{route.agency_name} · {routeKind(route.route_type)}</small></span>
-              <span className={`route-health ${statusClass(networkStatusByRoute.get(route.route_id)?.service_status)}`}>{statusLabel(networkStatusByRoute.get(route.route_id)?.service_status)}</span>
+              <span className="route-copy"><strong title={routeLabel(route)}>{routeLabel(route)}</strong><small>{route.agency_name} · {routeKind(route.route_type)}</small></span>
+              {/* Live status badges belong to LIVE only: beside recorded history
+                  they read as a finding about the period being analysed. */}
+              {mode === "live" && <span className={`route-health ${statusClass(networkStatusByRoute.get(route.route_id)?.service_status)}`}>{statusLabel(networkStatusByRoute.get(route.route_id)?.service_status)}</span>}
             </button>
           ))}
           {networkState === "ready" && filteredRoutes.length === 0 && <p className="empty-message">No routes match that filter.</p>}
@@ -1423,10 +2019,10 @@ export default function Home() {
             <p className="eyebrow">SELECTED ROUTE</p>
             <h2>{routeLabel(selectedRoute)}</h2>
             <p>{selectedRoute.description ?? "Static schedule geometry and stops from the selected GTFS feed."}</p>
-            <dl><div><dt>Agency</dt><dd>{selectedRoute.agency_name}</dd></div><div><dt>Feed version</dt><dd title={selectedRoute.feed_id}>{selectedRoute.feed_id.slice(0, 8)}</dd></div></dl>
-            {mode === "replay" ? <p className="replay-route-note">Static route details remain selected. Current live operations are deliberately hidden while recorded positions are replaying.</p> : <div className="operations-summary">
-              <div className={`service-state ${operations?.service_status?.toLowerCase().replaceAll("_", "-") ?? "no-live-data"}`}>
-                <span>Service status</span><strong>{operations?.service_status?.replaceAll("_", " ") ?? "NO LIVE DATA"}</strong>
+            <dl><div><dt>Agency</dt><dd>{selectedRoute.agency_name}</dd></div><div><dt>Timetable</dt><dd title={`Static GTFS feed ${selectedRoute.feed_id}`}>Published GTFS</dd></div></dl>
+            {mode !== "live" ? <p className="replay-route-note">{mode === "replay" ? "Static route details remain selected. Current live operations are deliberately hidden while recorded positions are replaying." : "This view uses recorded history only. Current live status for this route is shown in LIVE."}</p> : <div className="operations-summary">
+              <div className={`service-state ${statusClass(operations?.service_status)}`}>
+                <span>Service status</span><strong>{statusLabel(operations?.service_status)}</strong>
               </div>
               <div className="metric-grid">
                 <div><span>Active</span><strong>{vehicleState === "ready" ? operations?.active_vehicles ?? 0 : "—"}</strong></div>
@@ -1435,6 +2031,7 @@ export default function Home() {
               </div>
               <p className="operations-reason">{operations?.status_reason ?? "Loading current route operations…"}</p>
               {operations?.headway_baseline_seconds !== null && operations?.headway_baseline_seconds !== undefined && <p className="headway-note">{routeHeadwayEvidence(operations)}</p>}
+              {operations && horizonExclusionNote(operations) && <p className="headway-note excluded">{horizonExclusionNote(operations)}</p>}
               {routeAlerts.length > 0 && <div className="route-alerts">{routeAlerts.slice(0, 2).map((alert) => <p key={alert.id}><strong>{alert.effect?.replaceAll("_", " ") ?? "Alert"}:</strong> {alert.header ?? alert.description ?? "Service disruption"}<span>{formatAlertPeriod(alert)}</span></p>)}</div>}
             </div>}
             <section className="reliability-summary" aria-label="Recorded route reliability analytics">
@@ -1444,18 +2041,18 @@ export default function Home() {
                 <label>From<input aria-label="Reliability analysis start" type="datetime-local" min={toDateTimeLocalValue(analyticsAvailability.first_observed_at)} max={toDateTimeLocalValue(analyticsAvailability.last_observed_at)} value={toDateTimeLocalValue(analyticsStart)} onChange={(event) => {
                   const next = new Date(event.target.value);
                   if (Number.isNaN(next.valueOf())) return;
-                  setAnalyticsStart(next.toISOString());
+                  { analyticsAutoWindowRef.current = false; setAnalyticsStart(next.toISOString()); };
                 }} /></label>
                 <label>To<input aria-label="Reliability analysis end" type="datetime-local" min={toDateTimeLocalValue(analyticsAvailability.first_observed_at)} max={toDateTimeLocalValue(analyticsAvailability.last_observed_at)} value={toDateTimeLocalValue(analyticsEnd)} onChange={(event) => {
                   const next = new Date(event.target.value);
                   if (Number.isNaN(next.valueOf())) return;
-                  setAnalyticsEnd(next.toISOString());
+                  { analyticsAutoWindowRef.current = false; setAnalyticsEnd(next.toISOString()); };
                 }} /></label>
               </div>}
               <p className="analytics-message">{analyticsMessage}</p>
               {analytics && !canDisplayReliabilityEstimates(analytics.sufficient_history, analytics.delay_distribution.sufficient) && <div className="analytics-empty insufficient compact"><strong>Insufficient recorded history</strong><span>{analytics.sufficiency_reason}</span><small>{analytics.observation_count.toLocaleString()} observations · delay estimates are hidden until the configured evidence minimums are met.</small></div>}
               {analytics && canDisplayReliabilityEstimates(analytics.sufficient_history, analytics.delay_distribution.sufficient) && <>
-                <p className="analytics-source">DIRECT RECORDED OBSERVATIONS · delay samples {analytics.delay_distribution.sample_count.toLocaleString()}</p>
+                <p className="analytics-source">RECORDED OBSERVATIONS · delay samples {analytics.delay_distribution.sample_count.toLocaleString()}</p>
                 <div className="metric-grid reliability-metrics">
                   <div><span>Median delay</span><strong>{formatSignedSeconds(analytics.delay_distribution.median_seconds)}</strong></div>
                   <div><span>P10 delay</span><strong>{formatSignedSeconds(analytics.delay_distribution.percentile_10_seconds)}</strong></div>
@@ -1473,14 +2070,14 @@ export default function Home() {
                 </div>
                 <div className="headway-comparison">
                   <p className="analytics-source">HEADWAYS AT {analytics.observed_headways.stop_name ?? "NO MATCHED STOP"}</p>
-                  <div><span>DIRECT RECORDED STOP-SEQUENCE ENTRIES</span><strong>{formatSeconds(analytics.observed_headways.median_seconds)}</strong><small>{analytics.observed_headways.sample_count} adjacent headways · {analytics.observed_headways.bunching_event_count} bunching · {analytics.observed_headways.service_gap_event_count} gaps</small></div>
-                  <div><span>STATIC GTFS SCHEDULE</span><strong>{formatSeconds(analytics.scheduled_headways.median_seconds)}</strong><small>{analytics.scheduled_headways.sample_count} scheduled adjacent headways</small></div>
+                  <div><span>OBSERVED · RECORDED STOP ARRIVALS</span><strong>{formatSeconds(analytics.observed_headways.median_seconds)}</strong><small>{plural(analytics.observed_headways.sample_count, "adjacent headway")} · {analytics.observed_headways.bunching_event_count} bunching · {plural(analytics.observed_headways.service_gap_event_count, "gap")}</small></div>
+                  <div><span>SCHEDULED · GTFS TIMETABLE</span><strong>{formatSeconds(analytics.scheduled_headways.median_seconds)}</strong><small>{analytics.scheduled_headways.sample_count} scheduled adjacent headways</small></div>
                   <p>Median deviation: <strong>{formatSignedSeconds(analytics.median_headway_deviation_seconds)}</strong> versus scheduled.</p>
                 </div>
                 <div className="spatial-reliability-note">
                   <p className="analytics-source">SPATIAL RELIABILITY VIEW</p>
                   <p><i className="reliability-marker late" /> Late-record marker <i className="reliability-marker on-time" /> Recorded delay within tolerance <i className="reliability-marker unknown" /> No recorded delay value</p>
-                  <p>Markers on the map are sized by direct stop-sequence entries and open a stop-level summary.</p>
+                  <p>Markers on the map are sized by recorded stop arrivals and open a stop-level summary.</p>
                   {analytics.spatial_reliability.features.length > 0 && <ul>{analytics.spatial_reliability.features.slice(0, 3).map((feature) => <li key={feature.properties.stop_id}>{feature.properties.name}: {feature.properties.observation_count} entries · {formatSignedSeconds(feature.properties.median_delay_seconds)} median</li>)}</ul>}
                 </div>
                 <details className="analytics-notes"><summary>Method and source notes</summary>{analytics.data_notes.map((note) => <p key={note}>{note}</p>)}</details>
@@ -1498,6 +2095,8 @@ export default function Home() {
             <div><dt>Status</dt><dd>{selectedVehicle.current_status?.replaceAll("_", " ") ?? "Unknown"}</dd></div>
           </dl>
         </section>}
+        </>
+        )}
 
         <footer className="service-footer">
           <span><i className={`status-dot ${apiStatus}`} /> API {apiStatus}</span>

@@ -48,6 +48,7 @@ class SegmentTraversal:
     to_stop_sequence: int
     observed_start: datetime
     observed_end: datetime
+    outcome_available_at: datetime
     travel_seconds: float
     scheduled_seconds: int
     distance_m: float
@@ -61,18 +62,10 @@ class ExtractionResult:
     rejected_reason: str | None = None
 
 
-def _local_xy(point: tuple[float, float], origin_lat: float) -> tuple[float, float]:
-    lon, lat = point
-    return (
-        radians(lon) * EARTH_RADIUS_M * cos(radians(origin_lat)),
-        radians(lat) * EARTH_RADIUS_M,
-    )
-
-
-def project_onto_polyline(
+def _polyline_matches(
     point: tuple[float, float], shape: Sequence[tuple[float, float]]
-) -> ShapeMatch:
-    """Return distance along a lon/lat polyline and lateral error in metres."""
+) -> list[ShapeMatch]:
+    """Return a projection for every nonzero segment of a lon/lat polyline."""
 
     if len(shape) < 2:
         raise ValueError("shape must contain at least two points")
@@ -80,8 +73,7 @@ def project_onto_polyline(
     target_x, target_y = _local_xy(point, origin_lat)
     xy = [_local_xy(item, origin_lat) for item in shape]
     cumulative = 0.0
-    best_error_squared = float("inf")
-    best_progress = 0.0
+    matches: list[ShapeMatch] = []
     for start, end in zip(xy[:-1], xy[1:], strict=True):
         dx, dy = end[0] - start[0], end[1] - start[1]
         length_squared = dx * dx + dy * dy
@@ -97,20 +89,58 @@ def project_onto_polyline(
         )
         projected_x = start[0] + fraction * dx
         projected_y = start[1] + fraction * dy
-        error_squared = (target_x - projected_x) ** 2 + (target_y - projected_y) ** 2
         length = sqrt(length_squared)
-        if error_squared < best_error_squared:
-            best_error_squared = error_squared
-            best_progress = cumulative + fraction * length
+        matches.append(
+            ShapeMatch(
+                progress_m=cumulative + fraction * length,
+                lateral_error_m=sqrt((target_x - projected_x) ** 2 + (target_y - projected_y) ** 2),
+            )
+        )
         cumulative += length
-    if best_error_squared == float("inf"):
+    if not matches:
         raise ValueError("shape has no nonzero-length edge")
-    return ShapeMatch(best_progress, sqrt(best_error_squared))
+    return matches
+
+
+def _local_xy(point: tuple[float, float], origin_lat: float) -> tuple[float, float]:
+    lon, lat = point
+    return (
+        radians(lon) * EARTH_RADIUS_M * cos(radians(origin_lat)),
+        radians(lat) * EARTH_RADIUS_M,
+    )
+
+
+def project_onto_polyline(
+    point: tuple[float, float], shape: Sequence[tuple[float, float]]
+) -> ShapeMatch:
+    """Return distance along a lon/lat polyline and lateral error in metres."""
+
+    return min(_polyline_matches(point, shape), key=lambda match: match.lateral_error_m)
+
+
+def has_ambiguous_projection(
+    point: tuple[float, float],
+    shape: Sequence[tuple[float, float]],
+    *,
+    max_error_delta_m: float = 8.0,
+    min_progress_separation_m: float = 100.0,
+) -> bool:
+    """Whether two materially separate shape positions fit a point equally well."""
+
+    if max_error_delta_m < 0 or min_progress_separation_m < 0:
+        raise ValueError("ambiguity thresholds must be non-negative")
+    matches = sorted(_polyline_matches(point, shape), key=lambda match: match.lateral_error_m)
+    best = matches[0]
+    return any(
+        candidate.lateral_error_m <= best.lateral_error_m + max_error_delta_m
+        and abs(candidate.progress_m - best.progress_m) >= min_progress_separation_m
+        for candidate in matches[1:]
+    )
 
 
 def _interpolated_crossing(
     observations: Sequence[MatchedObservation], target_progress_m: float
-) -> tuple[datetime, float, float] | None:
+) -> tuple[datetime, datetime, float, float] | None:
     for before, after in zip(observations[:-1], observations[1:], strict=True):
         if before.progress_m <= target_progress_m <= after.progress_m:
             distance = after.progress_m - before.progress_m
@@ -121,6 +151,7 @@ def _interpolated_crossing(
             crossing = before.observed_at + (after.observed_at - before.observed_at) * fraction
             return (
                 crossing,
+                max(after.observed_at, after.recorded_at),
                 gap_seconds,
                 max(before.lateral_error_m, after.lateral_error_m),
             )
@@ -172,6 +203,8 @@ def extract_segment_traversals(
             return ExtractionResult((), "nonpositive_observation_interval")
         if before.progress_m - after.progress_m > max_regression_m:
             return ExtractionResult((), "nonmonotonic_vehicle_progress")
+        if after.current_stop_sequence < before.current_stop_sequence:
+            return ExtractionResult((), "regressing_vehicle_stop_sequence")
 
     crossings = [_interpolated_crossing(deduplicated, stop.progress_m) for stop in stops]
     traversals: list[SegmentTraversal] = []
@@ -180,8 +213,8 @@ def extract_segment_traversals(
     ):
         if left_crossing is None or right_crossing is None:
             continue
-        start, left_gap, left_error = left_crossing
-        end, right_gap, right_error = right_crossing
+        start, left_available_at, left_gap, left_error = left_crossing
+        end, right_available_at, right_gap, right_error = right_crossing
         travel_seconds = (end - start).total_seconds()
         distance_m = right_stop.progress_m - left_stop.progress_m
         bracketing_gap = max(left_gap, right_gap)
@@ -200,6 +233,7 @@ def extract_segment_traversals(
                 to_stop_sequence=right_stop.stop_sequence,
                 observed_start=start,
                 observed_end=end,
+                outcome_available_at=max(left_available_at, right_available_at),
                 travel_seconds=travel_seconds,
                 scheduled_seconds=scheduled_seconds,
                 distance_m=distance_m,

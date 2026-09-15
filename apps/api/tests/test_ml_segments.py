@@ -6,6 +6,7 @@ from transitpulse_ml.segments import (
     MatchedObservation,
     TripStop,
     extract_segment_traversals,
+    has_ambiguous_projection,
     project_onto_polyline,
 )
 
@@ -30,6 +31,16 @@ def test_polyline_projection_returns_progress_and_lateral_error() -> None:
     )
     assert match.progress_m == pytest.approx(55.6, abs=0.5)
     assert match.lateral_error_m == pytest.approx(0.0, abs=0.1)
+
+
+def test_self_intersection_projection_is_flagged_as_ambiguous() -> None:
+    shape = [(-113.5010, 53.5000), (-113.4990, 53.5020), (-113.5010, 53.5020), (-113.4990, 53.5000)]
+    assert has_ambiguous_projection((-113.5000, 53.5010), shape)
+
+
+def test_non_loop_projection_is_not_ambiguous() -> None:
+    shape = [(-113.5000, 53.5000), (-113.5000, 53.5020)]
+    assert not has_ambiguous_projection((-113.5000, 53.5010), shape)
 
 
 def test_extracts_arrival_crossings_with_sparse_gtfs_sequences() -> None:
@@ -71,6 +82,7 @@ def test_duplicate_timestamp_uses_latest_recording_deterministically() -> None:
     )
     assert len(result.traversals) == 1
     assert result.traversals[0].travel_seconds == pytest.approx(30.0)
+    assert result.traversals[0].outcome_available_at == BASE + timedelta(seconds=60)
 
 
 @pytest.mark.parametrize(
@@ -78,6 +90,7 @@ def test_duplicate_timestamp_uses_latest_recording_deterministically() -> None:
     [
         ([observation(0, 100, 1), observation(30, 50, 8)], "nonmonotonic_vehicle_progress"),
         ([observation(0, 100, 999), observation(30, 200, 8)], "unmatched_trip_stop_sequence"),
+        ([observation(0, 100, 8), observation(30, 200, 1)], "regressing_vehicle_stop_sequence"),
     ],
 )
 def test_rejects_invalid_runs(observations, reason: str) -> None:

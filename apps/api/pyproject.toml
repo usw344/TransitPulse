@@ -12,8 +12,12 @@ dependencies = [
   "fastapi>=0.115,<1",
   "gtfs-realtime-bindings>=1.0,<2",
   "geoalchemy2>=0.16,<1",
+  # The SCENARIOS estimator is imported by the API at startup (numpy) and its
+  # model artifact is a pickled scikit-learn pipeline built with 1.9.x.
+  "numpy>=2.0,<3",
   "psycopg[binary]>=3.2,<4",
   "pydantic-settings>=2.7,<3",
+  "scikit-learn>=1.9,<2",
   "sqlalchemy>=2.0,<3",
   "uvicorn[standard]>=0.34,<1",
 ]
@@ -22,6 +26,11 @@ dependencies = [
 dev = [
   "httpx>=0.28,<1",
   "pytest>=8,<10",
+]
+# Only scripts/train_cross_city_deep_model.py (the rejected deep-model
+# experiment) needs PyTorch; the application never imports it.
+research = [
+  "torch>=2.4",
 ]
 
 [project.scripts]

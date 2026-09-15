@@ -130,9 +130,19 @@ def delay_bands(
 
 
 def observed_stop_sequence_events(points: Iterable[RecordedPoint]) -> list[ObservedStopEvent]:
-    """Collapse repeated snapshots into observable vehicle sequence changes."""
+    """Collapse repeated snapshots into observable vehicle sequence changes.
+
+    A vehicle serves each stop of a trip once, so each (vehicle, trip, stop
+    sequence) yields at most one arrival.  Comparing against the immediately
+    previous snapshot alone is not enough: a feed that reports 40 -> 41 -> 40
+    -> 41 emits an arrival each time, inflating the event count and deflating
+    every headway derived from it.  Repeat visits to an already-observed stop
+    on the same trip are therefore treated as feed jitter and dropped, while a
+    later trip legitimately revisits the same sequence under a new trip id.
+    """
 
     last_sequence: dict[str, tuple[str | None, int]] = {}
+    observed_stops: set[tuple[str, str | None, int]] = set()
     events: list[ObservedStopEvent] = []
     for point in sorted(points, key=lambda item: (item.at, item.vehicle_id)):
         if point.current_stop_sequence is None:
@@ -143,10 +153,15 @@ def observed_stop_sequence_events(points: Iterable[RecordedPoint]) -> list[Obser
             # A window boundary only tells us where a vehicle already was; it
             # is not evidence that it entered that stop at this timestamp.
             last_sequence[point.vehicle_id] = state
+            observed_stops.add((point.vehicle_id, point.trip_id, point.current_stop_sequence))
             continue
         if previous == state:
             continue
         last_sequence[point.vehicle_id] = state
+        arrival_key = (point.vehicle_id, point.trip_id, point.current_stop_sequence)
+        if arrival_key in observed_stops:
+            continue
+        observed_stops.add(arrival_key)
         events.append(
             ObservedStopEvent(
                 at=point.at,

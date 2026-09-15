@@ -26,6 +26,7 @@ from transitpulse_api.models import (
     GtfsFeed,
     RealtimeAlert,
     RealtimeFeedStatus,
+    RealtimeTripObservation,
     RealtimeTripState,
     RealtimeVehicleState,
     Route,
@@ -74,6 +75,9 @@ class NormalizedTripUpdate:
     next_stop_id: str | None
     next_stop_sequence: int | None
     next_arrival_at: datetime | None
+    next_departure_at: datetime | None
+    next_arrival_delay_seconds: int | None
+    next_departure_delay_seconds: int | None
     observed_at: datetime | None
 
 
@@ -94,7 +98,22 @@ class NormalizedAlert:
 class IngestionResult:
     static_feed_id: UUID | None
     feed_counts: dict[str, int]
+    recorded_counts: dict[str, int]
     failures: dict[str, str]
+
+
+@dataclass(frozen=True)
+class TripObservationCandidates:
+    """Bounded active-vehicle candidates plus explicit no-timing exclusions."""
+
+    items: dict[str, tuple[NormalizedVehicle, NormalizedTripUpdate]]
+    skipped_no_timing_vehicle_trips: int
+
+
+@dataclass(frozen=True)
+class TripObservationRecordingResult:
+    inserted: int
+    skipped_no_timing_vehicle_trips: int
 
 
 def fetch_realtime_bytes(url: str) -> bytes:
@@ -178,18 +197,25 @@ def normalize_trip_update_entities(feed: ParsedRealtimeFeed) -> list[NormalizedT
         next_stop_id: str | None = None
         next_stop_sequence: int | None = None
         next_arrival_at: datetime | None = None
+        next_departure_at: datetime | None = None
+        next_arrival_delay_seconds: int | None = None
+        next_departure_delay_seconds: int | None = None
         for stop_update in update.stop_time_update:
             if stop_update.schedule_relationship == gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED:
                 continue
             arrival = stop_update.arrival if stop_update.HasField("arrival") else None
             departure = stop_update.departure if stop_update.HasField("departure") else None
-            event = arrival if arrival is not None and arrival.HasField("time") else departure
-            if event is None or not event.HasField("time"):
+            arrival_at = _timestamp(arrival.time) if arrival is not None and arrival.HasField("time") else None
+            departure_at = _timestamp(departure.time) if departure is not None and departure.HasField("time") else None
+            if arrival_at is None and departure_at is None:
                 continue
             next_stop_id = _optional_message_string(stop_update, "stop_id")
             next_stop_sequence = int(stop_update.stop_sequence) if stop_update.HasField("stop_sequence") else None
-            next_arrival_at = _timestamp(event.time)
-            event_delay = int(event.delay) if event.HasField("delay") else None
+            next_arrival_at = arrival_at or departure_at
+            next_departure_at = departure_at
+            next_arrival_delay_seconds = int(arrival.delay) if arrival is not None and arrival.HasField("delay") else None
+            next_departure_delay_seconds = int(departure.delay) if departure is not None and departure.HasField("delay") else None
+            event_delay = next_arrival_delay_seconds if next_arrival_delay_seconds is not None else next_departure_delay_seconds
             delay = event_delay if event_delay is not None else delay
             break
         updates.append(
@@ -202,6 +228,9 @@ def normalize_trip_update_entities(feed: ParsedRealtimeFeed) -> list[NormalizedT
                 next_stop_id=next_stop_id,
                 next_stop_sequence=next_stop_sequence,
                 next_arrival_at=next_arrival_at,
+                next_departure_at=next_departure_at,
+                next_arrival_delay_seconds=next_arrival_delay_seconds,
+                next_departure_delay_seconds=next_departure_delay_seconds,
                 observed_at=_timestamp(update.timestamp) if update.HasField("timestamp") else None,
             )
         )
@@ -305,13 +334,21 @@ def ingest_realtime(
         status.error_message = None
 
     counts = {kind: len(message.entities) for kind, message in parsed.items()}
+    recorded_counts: dict[str, int] = {}
     if static_feed is not None:
         _persist_current_state(session, static_feed.id, parsed)
-        _record_vehicle_observations(session, static_feed.id, parsed, recorded_at=observed_now)
+        vehicle_inserted = _record_vehicle_observations(session, static_feed.id, parsed, recorded_at=observed_now)
+        trip_observations = _record_active_trip_observations(session, static_feed.id, parsed, recorded_at=observed_now)
+        recorded_counts = {
+            "vehicle_observations_inserted": vehicle_inserted,
+            "trip_observations_inserted": trip_observations.inserted,
+            "trip_observations_skipped_no_timing": trip_observations.skipped_no_timing_vehicle_trips,
+        }
     session.commit()
     return IngestionResult(
         static_feed_id=static_feed.id if static_feed is not None else None,
         feed_counts=counts,
+        recorded_counts=recorded_counts,
         failures=failures,
     )
 
@@ -502,6 +539,102 @@ def _record_vehicle_observations(
     return inserted
 
 
+def _record_active_trip_observations(
+    session: Session,
+    static_feed_id: UUID,
+    parsed: dict[str, ParsedRealtimeFeed],
+    *,
+    recorded_at: datetime,
+) -> TripObservationRecordingResult:
+    """Record one source-published next-stop fact per active vehicle and poll.
+
+    Trip Updates can contain a high-volume full list of future stop updates.
+    Keeping only the first usable stop update for trips that also have a
+    VehiclePositions entry in this poll preserves a bounded-rate, immutable
+    operational-history fact.  This intentionally does not pretend to record
+    every Trip Update or to establish actual departure/dwell ground truth.
+    """
+
+    trip_feed = parsed.get("trip_updates")
+    if trip_feed is None:
+        return TripObservationRecordingResult(inserted=0, skipped_no_timing_vehicle_trips=0)
+    candidate_set = active_trip_observation_candidates(static_feed_id, parsed)
+    candidates = candidate_set.items
+    if not candidates:
+        return TripObservationRecordingResult(
+            inserted=0,
+            skipped_no_timing_vehicle_trips=candidate_set.skipped_no_timing_vehicle_trips,
+        )
+    existing = set(
+        session.scalars(
+            select(RealtimeTripObservation.observation_key).where(
+                RealtimeTripObservation.observation_key.in_(list(candidates))
+            )
+        )
+    )
+    inserted = 0
+    for key, (vehicle, update) in candidates.items():
+        if key in existing:
+            continue
+        session.add(
+            RealtimeTripObservation(
+                observation_key=key,
+                static_feed_id=static_feed_id,
+                source_timestamp=trip_feed.source_timestamp,
+                observed_at=update.observed_at,
+                recorded_at=recorded_at,
+                vehicle_id=vehicle.vehicle_id,
+                entity_id=update.entity_id,
+                trip_gtfs_id=update.trip_id,
+                route_gtfs_id=update.route_id or vehicle.route_id,
+                schedule_relationship=update.schedule_relationship,
+                delay_seconds=update.delay_seconds,
+                next_stop_id=update.next_stop_id,
+                next_stop_sequence=update.next_stop_sequence,
+                next_arrival_at=update.next_arrival_at,
+                next_departure_at=update.next_departure_at,
+                next_arrival_delay_seconds=update.next_arrival_delay_seconds,
+                next_departure_delay_seconds=update.next_departure_delay_seconds,
+            )
+        )
+        inserted += 1
+    return TripObservationRecordingResult(
+        inserted=inserted,
+        skipped_no_timing_vehicle_trips=candidate_set.skipped_no_timing_vehicle_trips,
+    )
+
+
+def active_trip_observation_candidates(
+    static_feed_id: UUID,
+    parsed: dict[str, ParsedRealtimeFeed],
+) -> TripObservationCandidates:
+    """Return timed active-vehicle candidates and count no-timing exclusions."""
+
+    trip_feed = parsed.get("trip_updates")
+    vehicle_feed = parsed.get("vehicle_positions")
+    if trip_feed is None or vehicle_feed is None:
+        return TripObservationCandidates(items={}, skipped_no_timing_vehicle_trips=0)
+    vehicles_by_trip: dict[str, list[NormalizedVehicle]] = {}
+    for vehicle in normalize_vehicle_entities(vehicle_feed):
+        if vehicle.trip_id:
+            vehicles_by_trip.setdefault(vehicle.trip_id, []).append(vehicle)
+
+    candidates: dict[str, tuple[NormalizedVehicle, NormalizedTripUpdate]] = {}
+    skipped_no_timing_vehicle_trips = 0
+    for update in normalize_trip_update_entities(trip_feed):
+        matching_vehicles = vehicles_by_trip.get(update.trip_id, [])
+        if update.next_arrival_at is None and update.next_departure_at is None:
+            skipped_no_timing_vehicle_trips += len(matching_vehicles)
+            continue
+        for vehicle in matching_vehicles:
+            key = trip_observation_key(static_feed_id, trip_feed.source_timestamp, vehicle, update)
+            candidates[key] = (vehicle, update)
+    return TripObservationCandidates(
+        items=candidates,
+        skipped_no_timing_vehicle_trips=skipped_no_timing_vehicle_trips,
+    )
+
+
 def observation_key(
     static_feed_id: UUID,
     source_timestamp: datetime | None,
@@ -525,6 +658,34 @@ def observation_key(
         "status": vehicle.current_status,
         "relationship": vehicle.schedule_relationship,
         "delay_seconds": delay_seconds,
+    }
+    return hashlib.sha256(json.dumps(fact, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def trip_observation_key(
+    static_feed_id: UUID,
+    source_timestamp: datetime | None,
+    vehicle: NormalizedVehicle,
+    update: NormalizedTripUpdate,
+) -> str:
+    """Stable identity for one immutable active-vehicle Trip Update fact."""
+
+    fact = {
+        "static_feed_id": str(static_feed_id),
+        "source_timestamp": source_timestamp.isoformat() if source_timestamp else None,
+        "vehicle_id": vehicle.vehicle_id,
+        "entity_id": update.entity_id,
+        "trip_id": update.trip_id,
+        "route_id": update.route_id or vehicle.route_id,
+        "schedule_relationship": update.schedule_relationship,
+        "delay_seconds": update.delay_seconds,
+        "next_stop_id": update.next_stop_id,
+        "next_stop_sequence": update.next_stop_sequence,
+        "next_arrival_at": update.next_arrival_at.isoformat() if update.next_arrival_at else None,
+        "next_departure_at": update.next_departure_at.isoformat() if update.next_departure_at else None,
+        "next_arrival_delay_seconds": update.next_arrival_delay_seconds,
+        "next_departure_delay_seconds": update.next_departure_delay_seconds,
+        "observed_at": update.observed_at.isoformat() if update.observed_at else None,
     }
     return hashlib.sha256(json.dumps(fact, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 

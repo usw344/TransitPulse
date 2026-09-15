@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   advanceReplayTimestamp,
   clampReplayTimestamp,
+  replayCoverageBuckets,
   replayFrameAt,
   replayTimestampAtFraction,
   vehicleDataForMode,
@@ -54,4 +55,57 @@ test("playback speed math advances recorded time deterministically", () => {
 test("live and replay vehicle sources remain distinct across mode changes", () => {
   assert.equal(vehicleDataForMode("replay", "live-data", "history-data"), "history-data");
   assert.equal(vehicleDataForMode("live", "live-data", "history-data"), "live-data");
+});
+
+function coverageObservation(at: string, vehicleId = "1"): ReplayObservation {
+  return {
+    type: "Feature",
+    geometry: { type: "Point", coordinates: [-113.5, 53.5] },
+    properties: {
+      vehicle_id: vehicleId,
+      static_feed_id: "feed-1",
+      observed_at: at,
+      source_timestamp: null,
+      recorded_at: at,
+    },
+  };
+}
+
+test("replay coverage keeps empty buckets so recording gaps stay visible", () => {
+  const start = "2026-09-11T20:00:00.000Z";
+  const end = "2026-09-11T20:40:00.000Z";
+  // Two observations in the first 10-minute bucket, one in the last.
+  const features = [
+    coverageObservation("2026-09-11T20:01:00.000Z"),
+    coverageObservation("2026-09-11T20:02:00.000Z"),
+    coverageObservation("2026-09-11T20:35:00.000Z"),
+  ];
+  const buckets = replayCoverageBuckets(features, start, end, 4);
+  assert.equal(buckets.length, 4);
+  assert.deepEqual(buckets.map((bucket) => bucket.count), [2, 0, 0, 1]);
+  assert.equal(buckets[0].start, start);
+});
+
+test("replay coverage ignores observations outside the window and bad input", () => {
+  const start = "2026-09-11T20:00:00.000Z";
+  const end = "2026-09-11T20:40:00.000Z";
+  const buckets = replayCoverageBuckets(
+    [coverageObservation("2026-09-11T19:00:00.000Z"), coverageObservation("2026-09-11T21:00:00.000Z")],
+    start,
+    end,
+    4,
+  );
+  assert.deepEqual(buckets.map((bucket) => bucket.count), [0, 0, 0, 0]);
+
+  assert.deepEqual(replayCoverageBuckets([], start, end, 4), []);
+  assert.deepEqual(replayCoverageBuckets([coverageObservation(start)], null, end, 4), []);
+  // An inverted window is not a window.
+  assert.deepEqual(replayCoverageBuckets([coverageObservation(start)], end, start, 4), []);
+});
+
+test("replay coverage places a boundary observation in the final bucket", () => {
+  const start = "2026-09-11T20:00:00.000Z";
+  const end = "2026-09-11T20:40:00.000Z";
+  const buckets = replayCoverageBuckets([coverageObservation(end)], start, end, 4);
+  assert.deepEqual(buckets.map((bucket) => bucket.count), [0, 0, 0, 1]);
 });

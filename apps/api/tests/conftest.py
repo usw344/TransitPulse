@@ -69,7 +69,7 @@ def db_session(database_ready: None) -> Session:
     """Give an integration test an isolated, migrated PostGIS database."""
 
     engine = get_engine()
-    table_names = "vehicle_observations, realtime_alerts, realtime_trip_states, realtime_vehicle_states, realtime_feed_statuses, stop_times, calendar_dates, trips, shapes, stops, routes, service_calendars, agencies, gtfs_feeds"
+    table_names = "realtime_trip_observations, vehicle_observations, realtime_alerts, realtime_trip_states, realtime_vehicle_states, realtime_feed_statuses, stop_times, calendar_dates, trips, shapes, stops, routes, service_calendars, agencies, gtfs_feeds"
     with engine.begin() as connection:
         connection.execute(text(f"TRUNCATE {table_names} RESTART IDENTITY CASCADE"))
     with Session(engine) as session:

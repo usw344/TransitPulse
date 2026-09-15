@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from uuid import UUID
 
 import pytest
 from google.transit import gtfs_realtime_pb2
@@ -6,6 +7,7 @@ from google.transit import gtfs_realtime_pb2
 from transitpulse_api.main import realtime_is_stale
 from transitpulse_api.realtime import (
     RealtimeFeedError,
+    active_trip_observation_candidates,
     normalize_alert_entities,
     normalize_trip_update_entities,
     normalize_vehicle_entities,
@@ -44,6 +46,8 @@ def _fixture_message() -> bytes:
     stop.stop_sequence = 4
     stop.arrival.time = 1_700_000_100
     stop.arrival.delay = 90
+    stop.departure.time = 1_700_000_140
+    stop.departure.delay = 105
 
     alert = message.entity.add()
     alert.id = "alert-entity"
@@ -69,11 +73,53 @@ def test_realtime_protobuf_normalization_preserves_optional_values() -> None:
     assert update.delay_seconds == 90
     assert update.next_stop_id == "stop-4"
     assert update.next_arrival_at == datetime.fromtimestamp(1_700_000_100, tz=timezone.utc)
+    assert update.next_departure_at == datetime.fromtimestamp(1_700_000_140, tz=timezone.utc)
+    assert update.next_arrival_delay_seconds == 90
+    assert update.next_departure_delay_seconds == 105
 
     alert = normalize_alert_entities(feed)[0]
     assert alert.header == "Detour"
     assert alert.affected_routes == ("100",)
     assert alert.affected_stops == ("stop-4",)
+
+
+def test_active_trip_observation_candidates_are_limited_to_current_vehicles() -> None:
+    feed = parse_realtime_feed(_fixture_message())
+
+    candidates = active_trip_observation_candidates(
+        UUID("12345678-1234-5678-1234-567812345678"),
+        {"vehicle_positions": feed, "trip_updates": feed},
+    )
+
+    assert len(candidates.items) == 1
+    assert candidates.skipped_no_timing_vehicle_trips == 0
+    vehicle, update = next(iter(candidates.items.values()))
+    assert vehicle.vehicle_id == "bus-42"
+    assert update.trip_id == "trip-100"
+    assert update.next_departure_at == datetime.fromtimestamp(1_700_000_140, tz=timezone.utc)
+
+
+def test_active_trip_observation_candidates_exclude_no_timing_updates() -> None:
+    message = gtfs_realtime_pb2.FeedMessage()
+    message.header.gtfs_realtime_version = "2.0"
+    message.header.timestamp = 1_700_000_000
+    vehicle = message.entity.add()
+    vehicle.id = "vehicle-entity"
+    vehicle.vehicle.vehicle.id = "bus-42"
+    vehicle.vehicle.trip.trip_id = "trip-100"
+    update = message.entity.add()
+    update.id = "trip-entity"
+    update.trip_update.trip.trip_id = "trip-100"
+    update.trip_update.stop_time_update.add().stop_sequence = 4
+    feed = parse_realtime_feed(message.SerializeToString())
+
+    candidates = active_trip_observation_candidates(
+        UUID("12345678-1234-5678-1234-567812345678"),
+        {"vehicle_positions": feed, "trip_updates": feed},
+    )
+
+    assert candidates.items == {}
+    assert candidates.skipped_no_timing_vehicle_trips == 1
 
 
 def test_realtime_parser_rejects_malformed_payload() -> None:

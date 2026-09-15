@@ -8,6 +8,7 @@ WORKDIR /workspace
 
 COPY apps/api/pyproject.toml /workspace/apps/api/pyproject.toml
 COPY apps/api/transitpulse_api /workspace/apps/api/transitpulse_api
+COPY apps/api/transitpulse_ml /workspace/apps/api/transitpulse_ml
 RUN pip install --editable "/workspace/apps/api[dev]"
 
 COPY alembic.ini /workspace/alembic.ini

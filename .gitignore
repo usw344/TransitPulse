@@ -1,9 +1,13 @@
 # Environment and local state
 .env
+.env.*
+!.env.example
+*.log
 .venv/
 .runtime/
 .transitpulse-logs/
 artifacts/
+milestone_snapshots/
 __pycache__/
 .pytest_cache/
 .coverage
@@ -25,6 +29,42 @@ apps/web/tsconfig.tsbuildinfo
 .DS_Store
 Thumbs.db
 .vscode/
-.env.example
-migrations/env.py
-migrations/env.py
+.idea/
+
+# Local editor and tooling settings (machine-specific)
+.claude/
+
+# MapLibre's tile-parsing worker, copied out of node_modules by
+# apps/web/scripts/copy-maplibre-worker.mjs on every predev/prebuild.
+# Deliberately NOT committed: a checked-in copy would silently go stale against
+# a newer installed maplibre-gl and reintroduce exactly the class of bug that
+# script exists to fix.
+apps/web/public/maplibre/
+
+# Safety net: third-party data, model outputs and databases must never be
+# committed, even if a script writes them outside artifacts/. The transit
+# agencies' GTFS archives are not ours to redistribute.
+*.zip
+*.pkl
+*.pt
+*.pth
+*.parquet
+*.jsonl
+*.sqlite
+*.db
+*.dump
+node_modules/
+
+# Private working notes, reviews and AI-assisted development handoffs.
+# These live outside the repository and must not be copied back in.
+SUPERVISOR.md
+WORKLOG.md
+currentHandoff.md
+PROJECT_COMPLETE.md
+M7_GATE5_ACCEPTANCE.md
+*PUBLICATION_AUDIT*
+*WORD_AND_IDENTIFIER_AUDIT*
+*Master_Project_Guide*
+TransitPulse_Private_Review/
+docs/portfolio_summary.md
+docs/demo_script.md

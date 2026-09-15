@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TransitPulse</title>
+<meta name="description" content="TransitPulse: real-time transit analytics for Edmonton on official GTFS and GTFS-Realtime data, with an experimental cross-city route-planning estimator.">
+<!--
+  Static project page. No build step and no external requests.
+  Repository: https://github.com/usw344/TransitPulse
+  Preview locally from the repository root:
+    python -m http.server 8765 --directory docs      then open http://localhost:8765/
+-->
+<style>
+  :root {
+    --ink: #0f172a;
+    --ink-soft: #334155;
+    --muted: #5b6b7c;
+    --line: #d6dee6;
+    --paper: #f4f7f9;
+    --card: #ffffff;
+    --night: #07131f;
+    --night-2: #0d1b28;
+    --night-line: #22384a;
+    --night-text: #c9d6e1;
+    --teal: #0f766e;
+    --teal-bright: #2dd4bf;
+    --orange: #c2410c;
+    --rose: #be123c;
+    --sky: #0369a1;
+    --radius: 10px;
+    --max: 1120px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font: 16px/1.6 "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  img { max-width: 100%; height: auto; display: block; }
+  a { color: var(--teal); }
+  a:focus-visible, button:focus-visible { outline: 3px solid var(--teal-bright); outline-offset: 2px; }
+  .wrap { max-width: var(--max); margin: 0 auto; padding-inline: 20px; }
+  code { font-family: Consolas, "SFMono-Regular", Menlo, monospace; font-size: .9em; background: #e7edf2; padding: .08em .35em; border-radius: 4px; }
+
+  /* Header */
+  .topbar { background: var(--night); color: #f8fafc; border-bottom: 1px solid var(--night-line); position: sticky; top: 0; z-index: 10; }
+  .topbar .wrap { display: flex; align-items: center; gap: 20px; min-height: 60px; flex-wrap: wrap; }
+  .brand { display: flex; align-items: center; gap: 10px; color: inherit; text-decoration: none; font-weight: 700; letter-spacing: -.01em; }
+  .logo { width: 32px; height: 32px; display: grid; place-items: center; background: #16c1b7; color: #052b2d; font-weight: 900; font-size: 13px; border-radius: 8px 2px 8px 2px; }
+  .topnav { display: flex; gap: 4px 16px; flex-wrap: wrap; margin-left: auto; font-size: 14px; }
+  .topnav a { color: #9fb3c4; text-decoration: none; padding: 4px 0; }
+  .topnav a:hover { color: #fff; }
+
+  /* Hero */
+  .hero { background: linear-gradient(180deg, var(--night) 0%, var(--night-2) 72%, var(--paper) 72%); color: #f8fafc; padding-block: 56px 0; }
+  .eyebrow { font-size: 12px; letter-spacing: .14em; text-transform: uppercase; color: var(--teal-bright); font-weight: 700; margin: 0 0 10px; }
+  .hero h1 { font-size: clamp(2.2rem, 5vw, 3.4rem); line-height: 1.05; letter-spacing: -.03em; margin: 0 0 16px; }
+  .hero .lede { font-size: clamp(1.05rem, 2vw, 1.25rem); color: var(--night-text); max-width: 760px; margin: 0 0 22px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 26px; padding: 0; list-style: none; }
+  .chips li { border: 1px solid var(--night-line); background: rgba(255,255,255,.04); color: #d8e4ec; border-radius: 999px; padding: 3px 12px; font-size: 13px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 36px; }
+  .btn { display: inline-block; padding: 10px 18px; border-radius: 8px; font-weight: 650; text-decoration: none; font-size: 15px; }
+  .btn-primary { background: var(--teal-bright); color: #03211f; }
+  .btn-primary:hover { background: #5eead4; }
+  .btn-secondary { border: 1px solid #3b5366; color: #e2ecf2; }
+  .btn-secondary:hover { border-color: var(--teal-bright); }
+  .hero-shot { border-radius: var(--radius); overflow: hidden; border: 1px solid #1f3444; box-shadow: 0 24px 60px rgba(2, 12, 20, .35); background: #0b1722; }
+  .caption { font-size: 13px; color: var(--muted); margin: 10px 2px 0; }
+
+  /* Sections */
+  section { padding-block: 64px 8px; }
+  h2 { font-size: clamp(1.5rem, 3vw, 2rem); letter-spacing: -.02em; line-height: 1.2; margin: 0 0 8px; }
+  .section-intro { color: var(--ink-soft); max-width: 760px; margin: 0 0 28px; }
+  h3 { font-size: 1.08rem; margin: 0 0 6px; letter-spacing: -.01em; }
+  .grid { display: grid; gap: 18px; }
+  .grid-2 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); }
+  .grid-3 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); }
+  .grid-4 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; }
+  .card p { margin: 0; color: var(--ink-soft); }
+  .mode-card { padding: 0; overflow: hidden; display: flex; flex-direction: column; }
+  .mode-card img { border-bottom: 1px solid var(--line); aspect-ratio: 16 / 9; object-fit: cover; object-position: top left; width: 100%; }
+  .mode-card .body { padding: 16px 18px 18px; }
+  .mode-tag { display: inline-block; font-size: 11px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; color: var(--teal); margin-bottom: 4px; }
+  .mode-tag.exp { color: var(--orange); }
+  .question { font-style: italic; color: var(--muted); font-size: 14px; margin: 0 0 6px !important; }
+
+  /* How it works */
+  .steps { counter-reset: step; list-style: none; padding: 0; margin: 0; }
+  .steps li { counter-increment: step; position: relative; padding-left: 48px; }
+  .steps li::before { content: counter(step); position: absolute; left: 0; top: 0; width: 32px; height: 32px; border-radius: 50%; background: var(--night); color: var(--teal-bright); display: grid; place-items: center; font-weight: 800; font-size: 14px; }
+
+  /* Architecture diagram */
+  .arch { background: var(--night); color: #e5edf3; border-radius: var(--radius); padding: 22px; border: 1px solid var(--night-line); }
+  .arch-cols { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); }
+  .lane { border: 1px dashed #36505f; border-radius: 8px; padding: 14px; }
+  .lane-title { font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--teal-bright); font-weight: 750; margin: 0 0 10px; }
+  .node { background: #10222f; border: 1px solid #2b4455; border-radius: 6px; padding: 8px 12px; font-size: 14px; }
+  .node small { display: block; color: #8fa8ba; font-size: 12px; }
+  .node.store { border-color: #1b7d74; background: #0c2a2b; }
+  .arrow { text-align: center; color: #5e7b8e; font-size: 18px; line-height: 1.2; margin: 4px 0; }
+  .merge { display: grid; gap: 4px; justify-items: center; margin-top: 12px; }
+  .merge .node { width: min(100%, 520px); text-align: center; }
+  .arch-notes { margin-top: 18px; }
+
+  /* Stack and tables */
+  .stack dt { font-weight: 700; font-size: 14px; }
+  .stack dd { margin: 0 0 12px; color: var(--ink-soft); font-size: 15px; }
+  .table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); }
+  table { border-collapse: collapse; width: 100%; min-width: 420px; font-size: 15px; }
+  th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--line); }
+  th { font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); background: #eef3f6; }
+  td.num { font-variant-numeric: tabular-nums; text-align: right; }
+  tr.win td { font-weight: 700; background: #ecfdf8; }
+  tr:last-child td { border-bottom: 0; }
+  ul.plain { padding-left: 1.1em; margin: 0; }
+  ul.plain.card { padding: 20px 20px 12px 40px; }
+  ul.plain li { margin-bottom: 8px; color: var(--ink-soft); }
+  ul.plain li > strong:first-child { display: block; color: var(--ink); }
+
+  /* Gallery */
+  .gallery figure { margin: 0; }
+  .gallery a { display: block; border-radius: var(--radius); overflow: hidden; border: 1px solid var(--line); background: var(--card); }
+  .gallery figcaption { font-size: 14px; color: var(--muted); margin-top: 8px; }
+
+  /* Limitations */
+  .note { border-left: 4px solid var(--orange); background: #fff7ed; border-radius: 0 var(--radius) var(--radius) 0; padding: 16px 20px; }
+  .note p { margin: 0 0 8px; }
+  .note p:last-child { margin: 0; }
+
+  /* Footer */
+  footer { margin-top: 64px; background: var(--night); color: #9fb3c4; padding-block: 36px; font-size: 14px; }
+  footer a { color: #d6e3ec; }
+  footer h3 { color: #f1f5f9; font-size: 14px; letter-spacing: .06em; text-transform: uppercase; }
+  footer p { margin: 0 0 10px; }
+
+  @media (max-width: 640px) {
+    .topbar { position: static; }
+    .topnav { margin-left: 0; }
+    .hero { padding-block: 36px 0; }
+    section { padding-block: 44px 4px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="wrap">
+    <a class="brand" href="#top"><span class="logo" aria-hidden="true">TP</span> TransitPulse</a>
+    <nav class="topnav" aria-label="Page sections">
+      <a href="#modes">What it does</a>
+      <a href="#how">How it works</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#modelling">Modelling</a>
+      <a href="#screenshots">Screenshots</a>
+      <a href="#limitations">Limitations</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+  <div class="hero">
+    <div class="wrap">
+      <p class="eyebrow">Portfolio project · 2026</p>
+      <h1>TransitPulse</h1>
+      <p class="lede">A web app that records Edmonton's live transit data and turns it into a live vehicle map, a replayable history and route reliability reports. An experimental planning tool, trained on timetables from eight North American transit agencies, estimates how a route change would affect trip times and the number of vehicles needed.</p>
+      <ul class="chips" aria-label="Project facts">
+        <li>FastAPI · PostgreSQL/PostGIS</li>
+        <li>Next.js · React · MapLibre</li>
+        <li>1.8M recorded vehicle observations</li>
+        <li>Runs locally · not deployed</li>
+      </ul>
+      <div class="actions">
+        <a class="btn btn-primary" href="https://github.com/usw344/TransitPulse">View the repository</a>
+      </div>
+      <figure class="hero-shot" style="margin:0">
+        <img src="screenshots/01-live-operations.png" width="1920" height="1080" alt="TransitPulse LIVE mode: a map of Edmonton with vehicles coloured by delay, a selected route, a queue of routes needing attention and publisher service alerts.">
+      </figure>
+      <p class="caption">LIVE mode on 2026-09-12: Edmonton Transit Service vehicles coloured by delay, one selected route and the list of routes needing attention.</p>
+    </div>
+  </div>
+
+  <section id="modes">
+    <div class="wrap">
+      <h2>What it does</h2>
+      <p class="section-intro">One web application with four modes. Each mode answers a single question, and each keeps measured values visibly separate from estimates.</p>
+      <div class="grid grid-2">
+        <article class="card mode-card">
+          <img src="screenshots/01-live-operations.png" width="1920" height="1080" loading="lazy" alt="LIVE mode screenshot">
+          <div class="body">
+            <span class="mode-tag">Live</span>
+            <p class="question">What is happening now?</p>
+            <p>Every reporting vehicle on a map, coloured by how late or early it is. Routes that need attention are flagged: buses bunched together, long gaps in service, or an average of 5+ minutes late or early. Service alerts and a route inspector sit alongside.</p>
+          </div>
+        </article>
+        <article class="card mode-card">
+          <img src="screenshots/02-replay.png" width="1920" height="1080" loading="lazy" alt="REPLAY mode screenshot">
+          <div class="body">
+            <span class="mode-tag">Replay</span>
+            <p class="question">What happened earlier?</p>
+            <p>Plays back where vehicles were at an earlier time, from a recorded history that is only ever added to. A coverage chart shows gaps in the recording rather than filling them in.</p>
+          </div>
+        </article>
+        <article class="card mode-card">
+          <img src="screenshots/03-analytics.png" width="1920" height="1080" loading="lazy" alt="ANALYTICS mode screenshot">
+          <div class="body">
+            <span class="mode-tag">Analytics</span>
+            <p class="question">How reliable was service?</p>
+            <p>For one route, compares how late vehicles actually ran, and how evenly they were spaced, with the published timetable. Results are broken down by stop and direction, shown on the map, and can be compared between two time periods.</p>
+          </div>
+        </article>
+        <article class="card mode-card">
+          <img src="screenshots/04-scenarios-design-change.png" width="1920" height="1080" loading="lazy" alt="SCENARIOS mode screenshot">
+          <div class="body">
+            <span class="mode-tag exp">Scenarios · experimental</span>
+            <p class="question">What might change if the route design changed?</p>
+            <p>Estimates how a change to a route (its length, number of stops, frequency or hours of service) would affect trip time, speed and the number of vehicles needed. Each estimate has a range and a confidence level based on how accurate the model proved in testing.</p>
+          </div>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section id="how">
+    <div class="wrap">
+      <h2>How it works</h2>
+      <p class="section-intro">Two streams of data feed one backend: Edmonton's live operations, and timetables from eight cities for planning.</p>
+      <div class="grid grid-2">
+        <div class="card">
+          <h3>Operations path</h3>
+          <ol class="steps">
+            <li><p><strong>Import</strong> Edmonton's published timetable and route network. The file is fully checked before anything is saved, and each timetable version is kept separately, so a new import never overwrites an old one. <em>Static GTFS into PostgreSQL/PostGIS, identified by the file's SHA-256 hash.</em></p></li>
+            <li style="margin-top:14px"><p><strong>Record</strong> the live feeds for vehicle positions, trip updates and alerts every 30 seconds. The current picture is refreshed, and new observations are added to a history that cannot be edited or deleted. <em>GTFS-Realtime, with the history protected by database triggers.</em></p></li>
+            <li style="margin-top:14px"><p><strong>Serve</strong> live operations, replays and route analytics to the web app. Requests have firm limits (a replay covers at most 24 hours and 5,000 records) instead of loading unlimited history.</p></li>
+          </ol>
+        </div>
+        <div class="card">
+          <h3>Planning path</h3>
+          <ol class="steps">
+            <li><p><strong>Combine</strong> timetables from eight transit agencies into one consistent format, keeping values read from the data separate from values that were calculated or assumed.</p></li>
+            <li style="margin-top:14px"><p><strong>Test</strong> seven conventional models and a neural network by leaving one whole city out of training at a time, so every score comes from a city the model never saw.</p></li>
+            <li style="margin-top:14px"><p><strong>Estimate</strong> a scenario by starting from the route's current scheduled speed and adding only the model's predicted change. The range and confidence come from the model's error on unseen cities.</p></li>
+          </ol>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="architecture">
+    <div class="wrap">
+      <h2>Architecture</h2>
+      <p class="section-intro">A deliberately simple setup: one web app, one backend service and one database, in a single codebase. The Next.js web app passes its data requests through to the FastAPI backend, so the browser only ever talks to one address.</p>
+      <div class="arch" role="img" aria-label="Architecture diagram: the ETS timetable and live feeds go through an importer and a recorder into PostgreSQL with PostGIS. Timetables from eight agencies are combined into a versioned dataset, which is used to test models and build a scenario estimator. The database and the estimator both feed the FastAPI service, which serves the Next.js and MapLibre frontend.">
+        <div class="arch-cols">
+          <div class="lane">
+            <p class="lane-title">Operations · Live, Replay, Analytics</p>
+            <div class="node">ETS timetable (static GTFS) <small>importer: all-or-nothing, one saved version per timetable</small></div>
+            <div class="arrow" aria-hidden="true">↓</div>
+            <div class="node">ETS live feeds (GTFS-Realtime) <small>vehicle positions, trip updates, alerts · recorded every 30 s</small></div>
+            <div class="arrow" aria-hidden="true">↓</div>
+            <div class="node store">PostgreSQL + PostGIS <small>route network · current state · add-only history</small></div>
+          </div>
+          <div class="lane">
+            <p class="lane-title">Planning · Scenarios</p>
+            <div class="node">Timetables from 8 agencies <small>combined into one format</small></div>
+            <div class="arrow" aria-hidden="true">↓</div>
+            <div class="node store">Versioned dataset <small>5,940 route records, checksums, QA report</small></div>
+            <div class="arrow" aria-hidden="true">↓</div>
+            <div class="node store">Scenario estimator <small>ridge model, ranges, accuracy by size of change</small></div>
+          </div>
+        </div>
+        <div class="merge">
+          <div class="arrow" aria-hidden="true">↓ ↓</div>
+          <div class="node">FastAPI <small>network · realtime · history · analytics · scenarios</small></div>
+          <div class="arrow" aria-hidden="true">↓</div>
+          <div class="node">Next.js + React + MapLibre <small>four modes over one map with a custom map style</small></div>
+        </div>
+      </div>
+
+      <div class="grid grid-3 arch-notes">
+        <div class="card"><h3>A history that cannot be rewritten</h3><p>Recorded vehicle observations can be added but never changed or deleted, so Replay and Analytics always show what the feed actually reported. Repeated copies of the same update are recognised and stored once. <em>Enforced by PostgreSQL triggers; each record's key is a hash of the source data and the timetable version.</em></p></div>
+        <div class="card"><h3>Locations stored as map data</h3><p>Stops, vehicle positions and route shapes are stored as geographic data, so the backend can work with them as places and send them straight to the interactive map. <em>PostGIS geometry with spatial indexes, returned to the map as GeoJSON.</em></p></div>
+        <div class="card"><h3>Tests that cannot touch real data</h3><p>Some tests empty database tables while they run. To keep that away from real data, the tests refuse to run unless the database is named as a test database. The full suite of 202 backend tests runs against a separate <code>transitpulse_test</code> database.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="features">
+    <div class="wrap">
+      <h2>Problems solved</h2>
+      <div class="grid grid-2">
+        <ul class="plain card">
+          <li><strong>Making service-frequency numbers accurate.</strong> Early calculations made Route 004, scheduled every 15 minutes, look like it ran every 2.5 minutes. Buses going both ways through a shared stop were counted together, and small timing wobbles in the feed were counted as extra arrivals. After fixing both, it measured 902 seconds between buses against a 900-second schedule.</li>
+          <li><strong>Not reporting numbers the data cannot support.</strong> When a route has too little recorded data, Analytics withholds its reliability figures. When two time periods have very different amounts of recorded data, the comparison declines to say which was better.</li>
+          <li><strong>Avoiding false service gaps.</strong> The live feed includes arrival predictions far into the future, which could make the live view show gaps in service that were not real. Predictions more than 90 minutes ahead are now left out of that calculation.</li>
+        </ul>
+        <ul class="plain card">
+          <li><strong>Making data builds repeatable.</strong> Building the dataset twice from identical code changed 280 of 842 Edmonton rows. The cause was a tie-break that depended on Python's randomised string hashing. Ties now break on value, and a test checks that repeated builds match exactly.</li>
+          <li><strong>Stopping the model from seeing the answer.</strong> The model predicts how fast a route's schedule runs, so any input calculated from that schedule's running time would give the answer away. Those fields are banned from the model's inputs, and a test enforces it. <em>This guards against feature leakage.</em></li>
+          <li><strong>Fixing a map that failed without an error.</strong> After the app was bundled, the map library looked for a background helper file in the wrong place and received a "page not found" response. Detailed map data then silently never loaded, while parts of the map still drew, which hid the problem. A build step now copies the file to a fixed location. <em>MapLibre's tile worker under the Turbopack bundler.</em></li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:32px">Tech stack</h3>
+      <div class="grid grid-4">
+        <dl class="stack card"><dt>Frontend</dt><dd>Next.js 16, React 19, TypeScript, MapLibre GL 6</dd></dl>
+        <dl class="stack card"><dt>Backend</dt><dd>FastAPI, Pydantic, SQLAlchemy 2, GeoAlchemy2</dd></dl>
+        <dl class="stack card"><dt>Data</dt><dd>PostgreSQL, PostGIS, Alembic; GTFS and GTFS-Realtime (protobuf)</dd></dl>
+        <dl class="stack card"><dt>Modelling</dt><dd>NumPy, scikit-learn; PyTorch for one rejected experiment</dd></dl>
+      </div>
+    </div>
+  </section>
+
+  <section id="modelling">
+    <div class="wrap">
+      <h2>Modelling result</h2>
+      <p class="section-intro">The estimator predicts a bus route's scheduled average speed, including time at stops. Each model was trained on seven cities and scored on the eighth, repeated for all eight, so every score comes from a city the model never saw. Scores are the average error in km/h across 4,922 bus route records; lower is better. <em>Leave-one-city-out validation, mean absolute error.</em></p>
+      <div class="grid grid-2">
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Model</th><th style="text-align:right">Average error on unseen cities (km/h)</th></tr></thead>
+            <tbody>
+              <tr class="win"><td>Ridge regression (used)</td><td class="num">3.36</td></tr>
+              <tr><td>Linear regression</td><td class="num">3.36</td></tr>
+              <tr><td>Random forest</td><td class="num">3.46</td></tr>
+              <tr><td>Histogram gradient boosting</td><td class="num">3.47</td></tr>
+              <tr><td>Decision tree</td><td class="num">3.82</td></tr>
+              <tr><td>Residual MLP (rejected)</td><td class="num">3.99</td></tr>
+              <tr><td>Physical stop-spacing model</td><td class="num">4.00</td></tr>
+              <tr><td>Global median</td><td class="num">4.75</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <ul class="plain card">
+          <li>A simple linear model beat more complex tree-based models and a small neural network. The neural network fit its training cities well but did poorly on new ones.</li>
+          <li>Scenarios start from the route's real scheduled speed and apply only the model's predicted <em>change</em>, so an unchanged plan returns the published schedule exactly.</li>
+          <li>Frequent routes tend to be slower because busy corridors get more service, not because frequency slows buses down. So frequency is kept out of the speed estimate and only changes how many vehicles are needed.</li>
+          <li>Across all test routes, the estimator beats the simple guess "this change has no effect" by 18%, but by only 0.5–2.3% for small edits. The app shows the figure for the size of change being made.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="screenshots">
+    <div class="wrap">
+      <h2>Screenshots</h2>
+      <div class="grid grid-2 gallery">
+        <figure><a href="screenshots/02-replay.png"><img src="screenshots/02-replay.png" width="1920" height="1080" loading="lazy" alt="REPLAY: recorded vehicles on Route 004 at the playhead with an observation coverage chart"></a><figcaption>REPLAY: recorded vehicle positions at the selected moment, with a chart of recording coverage.</figcaption></figure>
+        <figure><a href="screenshots/03-analytics.png"><img src="screenshots/03-analytics.png" width="1920" height="1080" loading="lazy" alt="ANALYTICS: Route 004 median delay over time, headway regularity and stop reliability on the map"></a><figcaption>ANALYTICS: how late buses ran and how evenly they were spaced, against the timetable.</figcaption></figure>
+        <figure><a href="screenshots/04-scenarios-design-change.png"><img src="screenshots/04-scenarios-design-change.png" width="1920" height="1080" loading="lazy" alt="SCENARIOS: Route 002 shortened with fewer stops, showing a low-confidence estimate with ranges"></a><figcaption>SCENARIOS, shorter route: 16.8→15.6 km and 58→48 stops, marked LOW confidence.</figcaption></figure>
+        <figure><a href="screenshots/05-scenarios-frequency-change.png"><img src="screenshots/05-scenarios-frequency-change.png" width="1920" height="1080" loading="lazy" alt="SCENARIOS: Route 002 peak headway from 10 to 8 minutes, speed held and vehicles recalculated"></a><figcaption>SCENARIOS, a bus every 8 minutes instead of 10: speed unchanged, vehicles needed 12→15.</figcaption></figure>
+        <figure><a href="screenshots/06-map-live-route.png"><img src="screenshots/06-map-live-route.png" width="1530" height="504" loading="lazy" alt="Map close-up: custom basemap, a selected route and delay-coloured vehicles with heading markers"></a><figcaption>Map: custom map style, with vehicles shown by delay and direction of travel.</figcaption></figure>
+        <figure><a href="screenshots/07-scenario-comparison.png"><img src="screenshots/07-scenario-comparison.png" width="1530" height="940" loading="lazy" alt="Scenario comparison: published plan, estimate with ranges, and the model card with validation details"></a><figcaption>The published plan, the estimate and a summary of how the model was tested, side by side.</figcaption></figure>
+      </div>
+    </div>
+  </section>
+
+  <section id="limitations">
+    <div class="wrap">
+      <h2>Limitations and research status</h2>
+      <div class="note">
+        <p><strong>The planning estimates are experimental.</strong> They approximate scheduled service, not observed running times. There is no road network and no ridership data, and for small edits the model is barely better than assuming no effect.</p>
+        <p><strong>Vehicle counts show how many vehicles a route would need, not an actual vehicle schedule,</strong> and the layover time added to each round trip is an assumption (10% of the round trip, at least 5 minutes).</p>
+        <p><strong>Recorded history has gaps</strong> whenever the recorder or the feed was down, and an "arrival" means the feed showed a vehicle moving on to its next stop, not an official arrival time.</p>
+        <p><strong>An earlier single-route simulator experiment never passed validation</strong> (none of 68 recorded runs covered the whole route) and is kept only as a research page. An experimental service optimizer is deliberately left out of the UI.</p>
+        <p><strong>It runs locally.</strong> There is no hosted deployment, authentication or rate limiting.</p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap grid grid-2">
+    <div>
+      <h3>Data sources and credits</h3>
+      <p>Edmonton Transit Service / City of Edmonton open data: static GTFS and GTFS-Realtime (Open Government Licence – Edmonton). Cross-city static GTFS: Calgary Transit (City of Calgary), TransLink, STM (CC BY 4.0), Winnipeg Transit, TriMet, Metro Transit (Minneapolis) and King County Metro.</p>
+      <p>Route and arrival data used in this product or service is provided by permission of TransLink. TransLink assumes no responsibility for the accuracy or currency of the Data used in this product or service. Transit scheduling, geographic, and real-time data provided by permission of King County. Contains information licensed under the Open Government Licence – Winnipeg.</p>
+      <p>Basemap in screenshots © CARTO, © OpenStreetMap contributors.</p>
+    </div>
+    <div>
+      <h3>Portfolio and evaluation notice</h3>
+      <p>This repository is provided primarily for portfolio review, hiring evaluation, and technical testing. Unless explicitly stated otherwise, publication of the source code does not grant permission to redistribute, republish, or reuse substantial portions of the project.</p>
+      <p><a href="https://github.com/usw344/TransitPulse">Repository</a> · <a href="#top">Back to top</a></p>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -1,2 +1,2 @@
-"""Reproducible modeling and digital-twin tooling for TransitPulse."""
+"""Reproducible modeling and route-simulation tooling for TransitPulse."""
 

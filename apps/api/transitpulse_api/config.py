@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     operations_severe_delay_seconds: int = 600
     operations_bunching_ratio: float = 0.5
     operations_gap_ratio: float = 1.75
+    # Predicted arrivals further ahead than this are not comparable current
+    # service: they are usually the next service period or a stale prediction,
+    # and treating them as headways invents rider-visible gaps that do not exist.
+    operations_prediction_horizon_seconds: int = 5400
     analytics_min_observations: int = 30
     analytics_min_delay_samples: int = 10
     analytics_min_coverage_seconds: int = 900

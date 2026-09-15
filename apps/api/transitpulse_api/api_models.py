@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class AgencyResponse(BaseModel):
@@ -143,6 +143,9 @@ class RouteOperationsResponse(BaseModel):
     headway_baseline_seconds: int | None
     bunching: bool
     service_gap: bool
+    #: Predicted arrivals excluded from the headway as non-comparable service.
+    excluded_arrivals_beyond_horizon: int = 0
+    prediction_horizon_seconds: int | None = None
 
 
 class NetworkRouteStatusResponse(BaseModel):
@@ -160,6 +163,9 @@ class NetworkRouteStatusResponse(BaseModel):
     headway_baseline_seconds: int | None
     bunching: bool
     service_gap: bool
+    #: Predicted arrivals excluded from the headway as non-comparable service.
+    excluded_arrivals_beyond_horizon: int = 0
+    prediction_horizon_seconds: int | None = None
     attention_score: int
 
 
@@ -217,3 +223,31 @@ class HistoryAvailabilityResponse(BaseModel):
     first_observed_at: datetime | None
     last_observed_at: datetime | None
     observation_count: int
+
+
+class ScenarioEstimateRequest(BaseModel):
+    """A proposed change to one route direction.
+
+    Every field is optional and omitting one means "leave it as scheduled".
+    That keeps the contract additive: a planner sends only what they changed,
+    and an empty request is a valid question whose answer is today's schedule.
+    """
+
+    key: str = Field(description="Route key from /api/scenarios/routes")
+    one_way_length_km: float | None = Field(default=None, gt=0, le=200)
+    stop_count: int | None = Field(default=None, ge=2, le=400)
+    day_type: Literal["weekday", "saturday", "sunday"] | None = None
+    peak_headway_minutes: float | None = Field(default=None, gt=0, le=240)
+    offpeak_headway_minutes: float | None = Field(default=None, gt=0, le=240)
+    median_headway_minutes: float | None = Field(default=None, gt=0, le=240)
+    service_span_hours: float | None = Field(default=None, gt=0, le=24.5)
+    recovery_fraction: float | None = Field(default=None, ge=0, le=1)
+
+    def changes(self) -> dict[str, object]:
+        """Only the fields the caller actually set."""
+
+        return {
+            name: value
+            for name, value in self.model_dump(exclude={"key"}).items()
+            if value is not None
+        }

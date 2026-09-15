@@ -108,3 +108,42 @@ def test_delay_buckets_preserve_empty_and_sparse_intervals() -> None:
     assert buckets[0].late_observation_count == 1
     assert buckets[1].observation_count == 0
     assert buckets[2].delay_observation_count == 0
+
+
+def test_sequence_regressions_do_not_emit_repeat_arrivals() -> None:
+    """Feed jitter must not manufacture extra arrivals at one stop."""
+
+    start = datetime(2026, 9, 11, 20, 0, tzinfo=timezone.utc)
+    # A vehicle observed flapping between stop 40 and 41 on the same trip.
+    sequences = [40, 40, 41, 40, 41, 40, 41, 42]
+    points = [
+        RecordedPoint(
+            at=start + timedelta(seconds=30 * index),
+            vehicle_id="2417",
+            trip_id="32904627",
+            current_stop_sequence=sequence,
+            delay_seconds=0,
+        )
+        for index, sequence in enumerate(sequences)
+    ]
+    events = observed_stop_sequence_events(points)
+    # 40 is the window-boundary baseline; only 41 and 42 are genuine progress.
+    assert [event.stop_sequence for event in events] == [41, 42]
+
+
+def test_same_sequence_is_counted_again_on_a_new_trip() -> None:
+    """A later trip legitimately revisits the same stop sequence."""
+
+    start = datetime(2026, 9, 11, 20, 0, tzinfo=timezone.utc)
+    points = [
+        RecordedPoint(at=start, vehicle_id="2417", trip_id="trip-a", current_stop_sequence=5, delay_seconds=0),
+        RecordedPoint(at=start + timedelta(minutes=1), vehicle_id="2417", trip_id="trip-a", current_stop_sequence=6, delay_seconds=0),
+        RecordedPoint(at=start + timedelta(minutes=2), vehicle_id="2417", trip_id="trip-b", current_stop_sequence=5, delay_seconds=0),
+        RecordedPoint(at=start + timedelta(minutes=3), vehicle_id="2417", trip_id="trip-b", current_stop_sequence=6, delay_seconds=0),
+    ]
+    events = observed_stop_sequence_events(points)
+    assert [(event.trip_id, event.stop_sequence) for event in events] == [
+        ("trip-a", 6),
+        ("trip-b", 5),
+        ("trip-b", 6),
+    ]

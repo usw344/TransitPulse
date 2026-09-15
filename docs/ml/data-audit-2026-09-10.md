@@ -4,7 +4,7 @@
 
 **Not ready for a credible learned travel-time model or a 30-day run.** The database contains 51.910 hours of elapsed wall-clock span but only 23 represented clock-hour buckets and about 19.76 hours of within-bucket coverage. Seventeen buckets are near-full hours. Two outages account for approximately 13 hours 32 minutes and 18 hours 37 minutes. The four represented calendar dates are therefore not four full days.
 
-Keep the recorder running. The current history is sufficient to build and deterministically smoke-test a segment-label/dataset pipeline, but model selection, deep-learning claims, digital-twin validation, and optimization remain blocked by broader chronological coverage and later gates.
+Keep the recorder running. The current history is sufficient to build and deterministically smoke-test a segment-label/dataset pipeline, but model selection, deep-learning claims, route-simulation validation, and optimization remain blocked by broader chronological coverage and later gates.
 
 ## Provenance and reproducibility
 
@@ -88,4 +88,4 @@ The official-source investigation is recorded in [`external-data-register.md`](e
 
 ## Gate 1 claim
 
-The claim submitted for independent review is limited to: the current data audit is reproducible and honest; the history is sparse/discontinuous and insufficient for credible deep modeling; the recorder should continue; and the narrow directed consecutive-stop operational travel-time target is scientifically and operationally appropriate for building a smoke-test pipeline. No model-performance, digital-twin, passenger-optimal, or optimization claim is made.
+The claim submitted for automated internal validation review is limited to: the current data audit is reproducible and accurately reflects the recorded data; the history is sparse/discontinuous and insufficient for credible deep modeling; the recorder should continue; and the narrow directed consecutive-stop operational travel-time target is scientifically and operationally appropriate for building a smoke-test pipeline. No model-performance, route-simulation, passenger-optimal, or optimization claim is made.
